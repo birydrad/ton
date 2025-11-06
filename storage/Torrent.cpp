@@ -18,6 +18,7 @@
 */
 
 #include "Torrent.h"
+#include "TorrentHeader.hpp"
 
 #include "td/utils/Status.h"
 #include "td/utils/crypto.h"

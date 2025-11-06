@@ -27,6 +27,8 @@
 #include "td/utils/Slice-decl.h"
 #include "td/utils/lz4.h"
 
+#include <bitset>
+
 namespace vm {
 
 td::Result<td::BufferSlice> boc_compress_baseline_lz4(const std::vector<td::Ref<vm::Cell>>& boc_roots) {

@@ -20,6 +20,8 @@
 #include "openssl/digest.hpp"
 #include "vm/cells/DataCell.h"
 
+#include <algorithm>
+
 namespace vm {
 
 namespace {
