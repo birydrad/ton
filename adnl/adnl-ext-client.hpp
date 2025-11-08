@@ -43,7 +43,10 @@ class AdnlOutboundConnection : public AdnlExtConnection {
  public:
   AdnlOutboundConnection(td::SocketFd fd, std::unique_ptr<AdnlExtConnection::Callback> callback, AdnlNodeIdFull dst,
                          td::actor::ActorId<AdnlExtClientImpl> ext_client)
-      : AdnlExtConnection(std::move(fd), std::move(callback), true), dst_(std::move(dst)), ext_client_(ext_client) {
+      : AdnlExtConnection(std::move(fd), std::move(callback), true)
+      , dst_(std::move(dst))
+      , local_id_(privkeys::Ed25519::random())
+      , ext_client_(ext_client) {
   }
   AdnlOutboundConnection(td::SocketFd fd, std::unique_ptr<AdnlExtConnection::Callback> callback, AdnlNodeIdFull dst,
                          PrivateKey local_id, td::actor::ActorId<AdnlExtClientImpl> ext_client)
@@ -67,6 +70,9 @@ class AdnlExtClientImpl : public AdnlExtClient {
  public:
   AdnlExtClientImpl(AdnlNodeIdFull dst_id, td::IPAddress dst_addr, std::unique_ptr<Callback> callback)
       : dst_(std::move(dst_id)), dst_addr_(dst_addr), callback_(std::move(callback)) {
+  }
+  AdnlExtClientImpl(AdnlNodeIdFull dst_id, std::string dst_host, std::unique_ptr<Callback> callback)
+      : dst_(std::move(dst_id)), dst_host_(std::move(dst_host)), callback_(std::move(callback)) {
   }
   AdnlExtClientImpl(AdnlNodeIdFull dst_id, PrivateKey local_id, td::IPAddress dst_addr,
                     std::unique_ptr<Callback> callback)
@@ -130,6 +136,7 @@ class AdnlExtClientImpl : public AdnlExtClient {
   AdnlNodeIdFull dst_;
   PrivateKey local_id_;
   td::IPAddress dst_addr_;
+  std::string dst_host_;
 
   std::unique_ptr<Callback> callback_;
 

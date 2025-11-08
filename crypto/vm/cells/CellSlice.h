@@ -32,7 +32,7 @@ struct NoVmOrd {};
 struct NoVmSpec {};
 
 class CellSlice : public td::CntObject {
-  Cell::VirtualizationParameters virt;
+  td::uint32 effective_level;
   Ref<DataCell> cell;
   CellUsageTree::NodePtr tree_node;
   unsigned bits_st, refs_st;
@@ -84,9 +84,6 @@ class CellSlice : public td::CntObject {
     return cell->special_type();
   }
   int child_merkle_depth(int merkle_depth) const {
-    if (merkle_depth == Cell::VirtualizationParameters::max_level()) {
-      return merkle_depth;
-    }
     if (cell->special_type() == Cell::SpecialType::MerkleProof ||
         cell->special_type() == Cell::SpecialType::MerkleUpdate) {
       merkle_depth++;
@@ -190,6 +187,7 @@ class CellSlice : public td::CntObject {
   }
   bool fetch_maybe_ref(Ref<Cell>& ref);
   bool prefetch_maybe_ref(Ref<Cell>& ref) const;
+  std::vector<Ref<Cell>> prefetch_all_refs() const;
   td::BitSlice fetch_bits(unsigned bits);
   td::BitSlice prefetch_bits(unsigned bits) const;
   td::Ref<CellSlice> fetch_subslice(unsigned bits, unsigned refs = 0);
@@ -257,6 +255,7 @@ class CellSlice : public td::CntObject {
   void dump(std::ostream& os, int level = 0, bool endl = true) const;
   void dump_hex(std::ostream& os, int mode = 0, bool endl = false) const;
   bool print_rec(std::ostream& os, int indent = 0) const;
+  bool print_rec(td::StringBuilder& sb, int indent = 0) const;
   bool print_rec(std::ostream& os, int* limit, int indent = 0) const;
   bool print_rec(int limit, std::ostream& os, int indent = 0) const;
   void error() const {
@@ -287,9 +286,8 @@ class CellSlice : public td::CntObject {
   void init_bits_refs();
   void init_preload() const;
   void preload_at_least(unsigned req_bits) const;
-  Cell::VirtualizationParameters child_virt() const {
-    return Cell::VirtualizationParameters(static_cast<td::uint8>(child_merkle_depth(virt.get_level())),
-                                          virt.get_virtualization());
+  td::uint32 child_effective_level() const {
+    return child_merkle_depth(effective_level);
   }
 };
 

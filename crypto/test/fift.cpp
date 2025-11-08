@@ -167,3 +167,19 @@ TEST(Fift, test_bls_ops) {
 TEST(Fift, test_levels) {
   run_fift("levels.fif");
 }
+
+TEST(Fift, test_secp256k1) {
+  run_fift("secp256k1.fif");
+}
+
+TEST(Fift, test_get_extra_balance) {
+  run_fift("get_extra_balance.fif");
+}
+
+TEST(Fift, test_p256) {
+  run_fift("p256.fif");
+}
+
+TEST(Fift, test_load_store_std_addr) {
+  run_fift("load-store-std-addr.fif");
+}

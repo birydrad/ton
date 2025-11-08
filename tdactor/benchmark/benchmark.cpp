@@ -139,7 +139,7 @@ class BlockSha256Baseline {
   }
   static void calc_hash(Block &block) {
     for (auto &cell : block.cells) {
-      td::sha256(cell.data, as_slice(cell.hash));
+      td::sha256(cell.data, as_mutable_slice(cell.hash));
     }
   }
   static td::Status check(Block &block) {
@@ -163,7 +163,7 @@ class BlockSha256Baseline {
         }
         cell_ref.hash_slice.copy_from(as_slice(block.get_cell(cell_ref.cell_id).hash));
       }
-      td::sha256(cell.data, as_slice(cell.hash));
+      td::sha256(cell.data, as_mutable_slice(cell.hash));
     }
   }
 };
@@ -195,7 +195,7 @@ class BlockSha256Threads {
   }
   static void calc_hash(Block &block) {
     parallel_map(block.cells.begin(), block.cells.end(),
-                 [](Cell &cell) { td::sha256(cell.data, as_slice(cell.hash)); });
+                 [](Cell &cell) { td::sha256(cell.data, as_mutable_slice(cell.hash)); });
   }
   static td::Status check_refs(Block &block) {
     std::atomic<bool> mismatch{false};
@@ -255,7 +255,7 @@ class BlockSha256MpmcQueue {
       }));
     }
     for (auto &cell : block.cells) {
-      queue->push([&cell]() { td::sha256(cell.data, as_slice(cell.hash)); }, threads_count);
+      queue->push([&cell]() { td::sha256(cell.data, as_mutable_slice(cell.hash)); }, threads_count);
     }
     for (size_t thread_id = 0; thread_id < threads_count; thread_id++) {
       queue->push(nullptr, threads_count);
@@ -283,7 +283,7 @@ class BlockSha256MpmcQueueCellPtr {
           if (cell == &poison) {
             return;
           }
-          td::sha256(cell->data, as_slice(cell->hash));
+          td::sha256(cell->data, as_mutable_slice(cell->hash));
         }
       }));
     }
@@ -312,6 +312,10 @@ class ActorExecutorBenchmark : public td::Benchmark {
       void add_to_queue(ActorInfoPtr ptr, SchedulerId scheduler_id, bool need_poll) override {
         //queue.push_back(std::move(ptr));
         q.push(ptr, 0);
+      }
+      void add_token_to_cpu_queue(SchedulerToken token, SchedulerId scheduler_id) override {
+        SchedulerMessage::Raw *raw = reinterpret_cast<SchedulerMessage::Raw *>(token);
+        q.push(SchedulerMessage(SchedulerMessage::acquire_t{}, raw), 0);
       }
       void set_alarm_timestamp(const ActorInfoPtr &actor_info_ptr) override {
         UNREACHABLE();
@@ -649,7 +653,7 @@ class BlockSha256Actors {
   }
   static void calc_hash(Block &block) {
     parallel_map(block.cells.begin(), block.cells.end(),
-                 [](Cell &cell) { td::sha256(cell.data, as_slice(cell.hash)); });
+                 [](Cell &cell) { td::sha256(cell.data, as_mutable_slice(cell.hash)); });
   }
 };
 

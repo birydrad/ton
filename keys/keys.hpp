@@ -52,7 +52,7 @@ class PublicKeyHash {
 
   td::UInt256 uint256_value() const {
     td::UInt256 x;
-    x.as_slice().copy_from(value_.as_slice());
+    x.as_mutable_slice().copy_from(value_.as_slice());
     return x;
   }
   td::Bits256 bits256_value() const {
@@ -259,6 +259,10 @@ class PublicKey {
   tl_object_ptr<ton_api::PublicKey> tl() const;
   td::BufferSlice export_as_slice() const;
   static td::Result<PublicKey> import(td::Slice s);
+
+  bool is_ed25519() const {
+    return pub_key_.get_offset() == pub_key_.offset<pubkeys::Ed25519>();
+  }
 
   pubkeys::Ed25519 ed25519_value() const {
     CHECK(pub_key_.get_offset() == pub_key_.offset<pubkeys::Ed25519>());

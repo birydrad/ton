@@ -17,6 +17,9 @@
 #pragma once
 
 #include "full-node.h"
+#include "validator-telemetry.hpp"
+
+#include <fstream>
 
 namespace ton::validator::fullnode {
 
@@ -24,13 +27,17 @@ class FullNodePrivateBlockOverlay : public td::actor::Actor {
  public:
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcast &query);
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcastCompressed &query);
+  void process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcastCompressedV2 &query);
   void process_block_broadcast(PublicKeyHash src, ton_api::tonNode_Broadcast &query);
 
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_newShardBlockBroadcast &query);
 
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_newBlockCandidateBroadcast &query);
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_newBlockCandidateBroadcastCompressed &query);
+  void process_broadcast(PublicKeyHash src, ton_api::tonNode_newBlockCandidateBroadcastCompressedV2 &query);
   void process_block_candidate_broadcast(PublicKeyHash src, ton_api::tonNode_Broadcast &query);
+
+  void process_telemetry_broadcast(PublicKeyHash src, const tl_object_ptr<ton_api::validator_telemetry>& telemetry);
 
   template <class T>
   void process_broadcast(PublicKeyHash, T &) {
@@ -42,16 +49,19 @@ class FullNodePrivateBlockOverlay : public td::actor::Actor {
   void send_block_candidate(BlockIdExt block_id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                             td::BufferSlice data);
   void send_broadcast(BlockBroadcast broadcast);
+  void send_validator_telemetry(tl_object_ptr<ton_api::validator_telemetry> telemetry);
+
+  void collect_validator_telemetry(std::string filename);
 
   void set_config(FullNodeConfig config) {
-    config_ = std::move(config);
+    opts_.config_ = std::move(config);
   }
 
   void start_up() override;
   void tear_down() override;
 
   FullNodePrivateBlockOverlay(adnl::AdnlNodeIdShort local_id, std::vector<adnl::AdnlNodeIdShort> nodes,
-                              FileHash zero_state_file_hash, FullNodeConfig config,
+                              FileHash zero_state_file_hash, FullNodeOptions opts,
                               td::actor::ActorId<keyring::Keyring> keyring, td::actor::ActorId<adnl::Adnl> adnl,
                               td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<rldp2::Rldp> rldp2,
                               td::actor::ActorId<overlay::Overlays> overlays,
@@ -60,7 +70,7 @@ class FullNodePrivateBlockOverlay : public td::actor::Actor {
       : local_id_(local_id)
       , nodes_(std::move(nodes))
       , zero_state_file_hash_(zero_state_file_hash)
-      , config_(config)
+      , opts_(opts)
       , keyring_(keyring)
       , adnl_(adnl)
       , rldp_(rldp)
@@ -74,7 +84,7 @@ class FullNodePrivateBlockOverlay : public td::actor::Actor {
   adnl::AdnlNodeIdShort local_id_;
   std::vector<adnl::AdnlNodeIdShort> nodes_;
   FileHash zero_state_file_hash_;
-  FullNodeConfig config_;
+  FullNodeOptions opts_;
   bool enable_compression_ = true;
 
   td::actor::ActorId<keyring::Keyring> keyring_;
@@ -91,18 +101,24 @@ class FullNodePrivateBlockOverlay : public td::actor::Actor {
 
   void try_init();
   void init();
+
+  td::actor::ActorOwn<ValidatorTelemetry> telemetry_sender_;
+  bool collect_telemetry_ = false;
+  std::ofstream telemetry_file_;
 };
 
 class FullNodeCustomOverlay : public td::actor::Actor {
  public:
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcast &query);
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcastCompressed &query);
+  void process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcastCompressedV2 &query);
   void process_block_broadcast(PublicKeyHash src, ton_api::tonNode_Broadcast &query);
 
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_externalMessageBroadcast &query);
 
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_newBlockCandidateBroadcast &query);
   void process_broadcast(PublicKeyHash src, ton_api::tonNode_newBlockCandidateBroadcastCompressed &query);
+  void process_broadcast(PublicKeyHash src, ton_api::tonNode_newBlockCandidateBroadcastCompressedV2 &query);
   void process_block_candidate_broadcast(PublicKeyHash src, ton_api::tonNode_Broadcast &query);
 
   template <class T>
@@ -117,14 +133,14 @@ class FullNodeCustomOverlay : public td::actor::Actor {
                             td::BufferSlice data);
 
   void set_config(FullNodeConfig config) {
-    config_ = std::move(config);
+    opts_.config_ = std::move(config);
   }
 
   void start_up() override;
   void tear_down() override;
 
   FullNodeCustomOverlay(adnl::AdnlNodeIdShort local_id, CustomOverlayParams params, FileHash zero_state_file_hash,
-                        FullNodeConfig config, td::actor::ActorId<keyring::Keyring> keyring,
+                        FullNodeOptions opts, td::actor::ActorId<keyring::Keyring> keyring,
                         td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<rldp::Rldp> rldp,
                         td::actor::ActorId<rldp2::Rldp> rldp2, td::actor::ActorId<overlay::Overlays> overlays,
                         td::actor::ActorId<ValidatorManagerInterface> validator_manager,
@@ -135,7 +151,7 @@ class FullNodeCustomOverlay : public td::actor::Actor {
       , msg_senders_(std::move(params.msg_senders_))
       , block_senders_(std::move(params.block_senders_))
       , zero_state_file_hash_(zero_state_file_hash)
-      , config_(config)
+      , opts_(opts)
       , keyring_(keyring)
       , adnl_(adnl)
       , rldp_(rldp)
@@ -152,7 +168,7 @@ class FullNodeCustomOverlay : public td::actor::Actor {
   std::map<adnl::AdnlNodeIdShort, int> msg_senders_;
   std::set<adnl::AdnlNodeIdShort> block_senders_;
   FileHash zero_state_file_hash_;
-  FullNodeConfig config_;
+  FullNodeOptions opts_;
 
   td::actor::ActorId<keyring::Keyring> keyring_;
   td::actor::ActorId<adnl::Adnl> adnl_;

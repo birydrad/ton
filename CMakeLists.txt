@@ -1,8 +1,7 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(TON VERSION 0.5 LANGUAGES C CXX)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-#set(OPENSSL_USE_STATIC_LIBS TRUE)
 
 # Define the two required variables before including the source code for watching a git repository.
 set(PRE_CONFIGURE_FILE "git.cc.in")
@@ -29,61 +28,24 @@ if (TON_REAL_BINARY_DIR STREQUAL TON_REAL_SOURCE_DIR)
   message(FATAL_ERROR "In-source build failed.")
 endif()
 
-# HAVE_SSE42 for crc32c and rocksdb
-include(CheckCXXSourceCompiles)
-# Check for SSE4.2 support in the compiler.
-set(OLD_CMAKE_REQURED_FLAGS ${CMAKE_REQUIRED_FLAGS})
-if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} /arch:AVX")
-else(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -msse4.2")
-endif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-check_cxx_source_compiles("
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else  // !defined(_MSC_VER)
-#include <cpuid.h>
-#include <nmmintrin.h>
-#endif  // defined(_MSC_VER)
-
-int main() {
-  _mm_crc32_u8(0, 0); _mm_crc32_u32(0, 0);
-#if defined(_M_X64) || defined(__x86_64__)
-   _mm_crc32_u64(0, 0);
-#endif // defined(_M_X64) || defined(__x86_64__)
-  return 0;
-}
-"  CRC32C_HAVE_SSE42)
-set(CMAKE_REQUIRED_FLAGS ${OLD_CMAKE_REQURED_FLAGS})
-
-if(NOT MSVC)
-  set(CMAKE_REQUIRED_FLAGS "-msse4.2 -mpclmul")
-endif()
-CHECK_CXX_SOURCE_COMPILES("
-#include <cstdint>
-#include <nmmintrin.h>
-#include <wmmintrin.h>
-int main() {
-  volatile uint32_t x = _mm_crc32_u32(0, 0);
-  const auto a = _mm_set_epi64x(0, 0);
-  const auto b = _mm_set_epi64x(0, 0);
-  const auto c = _mm_clmulepi64_si128(a, b, 0x00);
-  auto d = _mm_cvtsi128_si64(c);
-}
-" ROCKSDB_HAVE_SSE42)
-unset(CMAKE_REQUIRED_FLAGS)
-
-if (ROCKSDB_HAVE_SSE42 AND CRC32C_HAVE_SSE42)
-  set(HAVE_SSE42 TRUE)
-else()
-  set(HAVE_SSE42 FALSE)
-endif()
-
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_EXTENSIONS FALSE)
 
+set(CMAKE_COLOR_DIAGNOSTICS TRUE)
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(GCC 1)
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(CLANG 1)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
+  set(INTEL 1)
+elseif (NOT MSVC)
+  message(FATAL_ERROR "Compiler isn't supported")
+endif()
+
 #BEGIN internal
+option(BUILD_SHARED_LIBS "Use \"ON\" to build shared libraries instead of static where it's not specified (not recommended)" OFF)
 option(USE_EMSCRIPTEN "Use \"ON\" for config building wasm." OFF)
 option(TON_ONLY_TONLIB "Use \"ON\" to build only tonlib." OFF)
 if (USE_EMSCRIPTEN)
@@ -103,7 +65,18 @@ option(TONLIB_ENABLE_JNI "Use \"ON\" to enable JNI-compatible TonLib API.")
 option(TON_USE_ASAN "Use \"ON\" to enable AddressSanitizer." OFF)
 option(TON_USE_TSAN "Use \"ON\" to enable ThreadSanitizer." OFF)
 option(TON_USE_UBSAN "Use \"ON\" to enable UndefinedBehaviorSanitizer." OFF)
+option(TON_USE_COVERAGE "Use \"ON\" to enable code coverage with gcov." OFF)
 set(TON_ARCH "native" CACHE STRING "Architecture, will be passed to -march=")
+
+option(TON_PRINT_BACKTRACE_ON_CRASH "Attempt to print a backtrace when a fatal signal is caught" ON)
+
+option(TON_USE_LLD "Use LLD for linking" OFF)
+
+if (TON_USE_LLD)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=lld")
+    set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -fuse-ld=lld")
+endif()
 
 #BEGIN M1 support
 EXECUTE_PROCESS( COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCHITECTURE )
@@ -114,21 +87,37 @@ if ((ARCHITECTURE MATCHES "arm64") AND (CMAKE_SYSTEM_NAME STREQUAL "Darwin") AND
 endif()
 #END M1 support
 
+if (CLANG AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "20")
+  add_compile_options(--warning-suppression-mappings=${CMAKE_SOURCE_DIR}/suppression_mappings.txt)
+endif()
+
+option(TON_WERROR_BUILD "Use -Werror" OFF)
+
+# If we want to check -Werror build in CI, we want to use it for third party projects as well but we
+# don't want to force our warning options on them.
+if (TON_WERROR_BUILD)
+  add_compile_options(-Werror)
+endif()
+
 if (TON_USE_ABSEIL)
   message("Add abseil-cpp")
-  set(ABSL_PROPAGATE_CXX_STD TRUE)
-  add_subdirectory(third-party/abseil-cpp EXCLUDE_FROM_ALL)
+  function(abseil_scope)
+    set(ABSL_PROPAGATE_CXX_STD TRUE)
+    set(CMAKE_POLICY_VERSION_MINIMUM "3.10")
+    add_subdirectory(third-party/abseil-cpp EXCLUDE_FROM_ALL)
+  endfunction()
+  abseil_scope()
   set(ABSL_FOUND 1)
 endif()
 
-#add_subdirectory(third-party/libcuckoo EXCLUDE_FROM_ALL)
-#add_subdirectory(third-party/junction EXCLUDE_FROM_ALL)
-
 if (WIN32)
   message("Add wingetopt")
-  add_subdirectory(third-party/wingetopt EXCLUDE_FROM_ALL)
+  function(wingetopt_scope)
+    set(CMAKE_POLICY_VERSION_MINIMUM "3.10")
+    add_subdirectory(third-party/wingetopt EXCLUDE_FROM_ALL)
+  endfunction()
+  wingetopt_scope()
   set(WINGETOPT_FOUND 1)
-  message(STATUS "Use wingetopt")
 endif()
 
 set(CRC32C_BUILD_TESTS OFF CACHE BOOL "Build CRC32C's unit tests")
@@ -136,16 +125,15 @@ set(CRC32C_BUILD_BENCHMARKS OFF CACHE BOOL "Build CRC32C's benchmarks")
 set(CRC32C_USE_GLOG OFF CACHE BOOL "Build CRC32C's tests with Google Logging")
 set(CRC32C_INSTALL OFF CACHE BOOL "Install CRC32C's header and library")
 message("Add crc32c")
-if (NOT MSVC)
-  set(OLD_CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
-  # fix aarch64 build @ crc32c/src/crc32c_arm64_linux_check.h
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=address")
+function(crc32_scope)
+  set(CMAKE_POLICY_VERSION_MINIMUM "3.10")
+  if (NOT MSVC)
+    # fix aarch64 build @ crc32c/src/crc32c_arm64_linux_check.h
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=address")
+  endif()
   add_subdirectory(third-party/crc32c EXCLUDE_FROM_ALL)
-  set(CMAKE_CXX_FLAGS ${OLD_CMAKE_CXX_FLAGS})
-  unset(OLD_CMAKE_CXX_FLAGS)
-else()
-  add_subdirectory(third-party/crc32c EXCLUDE_FROM_ALL)
-endif()
+endfunction()
+crc32_scope()
 set(CRC32C_FOUND 1)
 
 if (TON_USE_ROCKSDB)
@@ -155,9 +143,13 @@ if (TON_USE_ROCKSDB)
   set(WITH_GFLAGS OFF CACHE BOOL "build with GFlags")
   set(WITH_TESTS OFF CACHE BOOL "build with tests")
   set(WITH_TOOLS OFF CACHE BOOL "build with tools")
+  set(USE_RTTI ON CACHE BOOL "use rtti")
   set(FAIL_ON_WARNINGS OFF CACHE BOOL "fail on warnings")
   message("Add rocksdb")
   add_subdirectory(third-party/rocksdb EXCLUDE_FROM_ALL)
+  # Broken CMake in rocksdb alters properties it has no business changing.
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK)
 endif()
 
 option(USE_COROUTINES "experimental support of coroutines" OFF)
@@ -179,30 +171,25 @@ if (USE_LIBRAPTORQ)
   add_subdirectory(third-party/libraptorq EXCLUDE_FROM_ALL)
 endif()
 
+message("Add tl-parser")
+add_subdirectory(third-party/tl-parser EXCLUDE_FROM_ALL)
+
 message("Add ton")
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake" ${CMAKE_MODULE_PATH})
 
 include(BuildBLST)
+include(BuildSECP256K1)
 
 # Configure CCache if available
 find_program(CCACHE_FOUND ccache)
-#set(CCACHE_FOUND 0)
 if (CCACHE_FOUND)
-  message(STATUS "Found ccache")
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+  if (NOT DEFINED CMAKE_C_COMPILER_LAUNCHER AND NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+    message(STATUS "Using ccache")
+    set(CMAKE_C_COMPILER_LAUNCHER ccache)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
+  endif()
 else()
   message(STATUS "Could NOT find ccache")
-endif()
-
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set(GCC 1)
-elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(CLANG 1)
-elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
-  set(INTEL 1)
-elseif (NOT MSVC)
-  message(FATAL_ERROR "Compiler isn't supported")
 endif()
 
 include(CheckCXXCompilerFlag)
@@ -222,7 +209,7 @@ endif()
 if (TON_ARCH AND NOT MSVC)
   CHECK_CXX_COMPILER_FLAG( "-march=${TON_ARCH}" COMPILER_OPT_ARCH_SUPPORTED )
   if (TON_ARCH STREQUAL "apple-m1")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=${TON_ARCH}")	
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=${TON_ARCH}")
   elseif(COMPILER_OPT_ARCH_SUPPORTED)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=${TON_ARCH}")
   elseif(NOT TON_ARCH STREQUAL "native")
@@ -236,6 +223,11 @@ endif()
 if (TON_USE_JEMALLOC)
   find_package(jemalloc REQUIRED)
 endif()
+
+if (NIX)
+  find_package(Secp256k1 REQUIRED)
+endif()
+
 
 set(MEMPROF "" CACHE STRING "Use one of \"ON\", \"FAST\" or \"SAFE\" to enable memory profiling. \
 Works under macOS and Linux when compiled using glibc. \
@@ -275,7 +267,7 @@ elseif (CLANG OR GCC)
       set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -Wl,--exclude-libs,ALL")
     endif()
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
-    if (NOT TON_USE_ASAN AND NOT TON_USE_TSAN AND NOT MEMPROF)
+    if (NOT TON_USE_ASAN AND NOT TON_USE_TSAN AND NOT TON_USE_COVERAGE AND NOT MEMPROF)
       if (NOT USE_EMSCRIPTEN)
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--exclude-libs,ALL")
       endif()
@@ -306,57 +298,70 @@ set(TONLIB_COMPILE "0")
   set(TONLIB_COMPILE "1")
 #END tonlib
 
-include(AddCXXCompilerFlag)
 if (MSVC)
-  add_cxx_compiler_flag("/experimental:external /external:anglebrackets /external:W0")
-endif()
-if (NOT MSVC)
-  add_cxx_compiler_flag("-Wall")
-  add_cxx_compiler_flag("-Wextra")
+  add_compile_options(/experimental:external /external:anglebrackets /external:W0)
 endif()
 
-add_cxx_compiler_flag("-Wimplicit-fallthrough=2")
-add_cxx_compiler_flag("-Wpointer-arith")
-add_cxx_compiler_flag("-Wcast-qual")
-add_cxx_compiler_flag("-Wsign-compare")
-add_cxx_compiler_flag("-Wduplicated-branches")
-add_cxx_compiler_flag("-Wduplicated-cond")
-add_cxx_compiler_flag("-Walloc-zero")
-add_cxx_compiler_flag("-Wlogical-op")
-add_cxx_compiler_flag("-Wno-tautological-compare")
-add_cxx_compiler_flag("-Wpointer-arith")
-add_cxx_compiler_flag("-Wvla")
-add_cxx_compiler_flag("-Wnon-virtual-dtor")
-add_cxx_compiler_flag("-Wno-unused-parameter")
-add_cxx_compiler_flag("-Wconversion")
-add_cxx_compiler_flag("-Wno-sign-conversion")
-add_cxx_compiler_flag("-Qunused-arguments")
-add_cxx_compiler_flag("-Wno-unused-private-field")
-add_cxx_compiler_flag("-Wno-redundant-move")
-#add_cxx_compiler_flag("-Werror")
+if (GCC OR CLANG)
+  add_compile_options(-Wall)
+  add_compile_options(-Wextra)
 
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem /usr/include/c++/v1")
-if (CLANG)
-  #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
-endif()
-if (TON_USE_ASAN)
-  if (CLANG)
-    add_cxx_compiler_flag("-stdlib=libc++")
+  add_compile_options(-Wpointer-arith)
+  add_compile_options(-Wcast-qual)
+  add_compile_options(-Wsign-compare)
+  add_compile_options(-Wpointer-arith)
+  add_compile_options(-Wvla)
+  add_compile_options(-Wnon-virtual-dtor)
+  add_compile_options(-Wconversion)
+
+  # TODO: Either justify all of these or remove.
+  add_compile_options(-Wno-tautological-compare)
+  add_compile_options(-Wno-unused-parameter)
+  add_compile_options(-Wno-sign-conversion)
+  add_compile_options(-Wno-unused-private-field)
+  add_compile_options(-Wno-redundant-move)
+
+  if (GCC)
+    add_compile_options(-Wimplicit-fallthrough=2)
+    add_compile_options(-Wduplicated-branches)
+    add_compile_options(-Wduplicated-cond)
+    add_compile_options(-Walloc-zero)
+    add_compile_options(-Wlogical-op)
   endif()
-  add_cxx_compiler_flag("-fsanitize=address")
+endif()
+
+if (GCC OR CLANG)
+  if (CMAKE_BUILD_TYPE MATCHES "RelWithDebInfo")
+    # For historical reasons, CMake falls back to -O2 optimization level when CMAKE_BUILD_TYPE is
+    # set to RelWithDebInfo.
+    add_compile_options(-O3)
+  endif()
+endif()
+
+if (TON_USE_ASAN)
+  add_compile_options(-fsanitize=address)
+  add_link_options(-fsanitize=address)
   add_definitions(-DTD_USE_ASAN=1)
 endif()
 if (TON_USE_TSAN)
-  if (CLANG)
-    add_cxx_compiler_flag("-stdlib=libc++")
-  endif()
-  add_cxx_compiler_flag("-fsanitize=thread")
+  add_compile_options(-fsanitize=thread)
+  add_link_options(-fsanitize=thread)
 endif()
 if (TON_USE_UBSAN)
-  if (CLANG)
-    add_cxx_compiler_flag("-stdlib=libc++")
-  endif()
-  add_cxx_compiler_flag("-fsanitize=undefined")
+  add_compile_options(-fsanitize=undefined)
+  add_link_options(-fsanitize=undefined)
+endif()
+if (TON_USE_COVERAGE)
+  add_cxx_compiler_flag("-fprofile-arcs")
+  add_cxx_compiler_flag("-ftest-coverage")
+  add_cxx_compiler_flag("--coverage")
+  add_cxx_compiler_flag("-O0")
+  add_cxx_compiler_flag("-g")
+  add_cxx_compiler_flag("-fno-inline")
+  add_cxx_compiler_flag("-fno-inline-small-functions")
+  add_cxx_compiler_flag("-fno-default-inline")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-arcs -ftest-coverage --coverage")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fprofile-arcs -ftest-coverage --coverage")
 endif()
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread")
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
@@ -381,6 +386,10 @@ if (NOT LATEX_FOUND)
   message(STATUS "Could NOT find LATEX (this is NOT an error)")
 endif()
 #END internal
+
+if (NOT OPENSSL_FOUND)
+  find_package(OpenSSL REQUIRED)
+endif()
 
 function(target_link_libraries_system target)
   set(libs ${ARGN})
@@ -409,14 +418,18 @@ add_subdirectory(adnl)
 add_subdirectory(crypto)
 add_subdirectory(lite-client)
 add_subdirectory(emulator)
+add_subdirectory(tolk)
 
 #BEGIN tonlib
 add_subdirectory(tonlib)
 #END tonlib
 
+# Temporary (?) move those two targets in TONLIB targets
+add_subdirectory(common)
+add_subdirectory(http)
+
 #BEGIN internal
 if (NOT TON_ONLY_TONLIB)
-add_subdirectory(common)
 add_subdirectory(tdfec)
 add_subdirectory(keyring)
 add_subdirectory(fec)
@@ -434,7 +447,6 @@ add_subdirectory(validator-engine-console)
 add_subdirectory(create-hardfork)
 add_subdirectory(dht-server)
 add_subdirectory(utils)
-add_subdirectory(http)
 add_subdirectory(rldp-http-proxy)
 endif()
 #END internal
@@ -471,10 +483,6 @@ target_link_libraries(test-fift PRIVATE fift-lib)
 
 add_executable(test-tdutils test/test-td-main.cpp ${TDUTILS_TEST_SOURCE})
 target_link_libraries(test-tdutils PRIVATE tdutils ${CMAKE_THREAD_LIBS_INIT} memprof ${JEMALLOC_LIBRARIES})
-#target_link_libraries_system(test-tdutils absl::base absl::container absl::hash )
-#target_link_libraries_system(test-tdutils libcuckoo)
-#target_include_directories(test-tdutils PRIVATE SYSTEM ${JUNCTION_ALL_INCLUDE_DIRS})
-#target_link_libraries(test-tdutils PRIVATE ${JUNCTION_ALL_LIBRARIES})
 
 add_executable(test-tdactor test/test-td-main.cpp ${TDACTOR_TEST_SOURCE})
 target_link_libraries(test-tdactor PRIVATE tdactor ${CMAKE_THREAD_LIBS_INIT})
@@ -484,10 +492,10 @@ target_link_libraries(test-net PRIVATE tdnet tdutils ${CMAKE_THREAD_LIBS_INIT})
 
 #BEGIN tonlib
 add_executable(test-tonlib ${TONLIB_ONLINE_TEST_SOURCE})
-target_link_libraries(test-tonlib tdutils tdactor adnllite tl_api ton_crypto ton_block tl_tonlib_api tonlib)
+target_link_libraries(test-tonlib tdactor adnllite tl_api ton_crypto tl_tonlib_api tonlib)
 
 add_executable(test-tonlib-offline test/test-td-main.cpp ${TONLIB_OFFLINE_TEST_SOURCE})
-target_link_libraries(test-tonlib-offline tdutils tdactor adnllite tl_api ton_crypto ton_block fift-lib tl_tonlib_api tonlib)
+target_link_libraries(test-tonlib-offline tdactor adnllite tl_api ton_crypto fift-lib tl_tonlib_api tonlib)
 
 if (NOT CMAKE_CROSSCOMPILING)
   add_dependencies(test-tonlib-offline gen_fif)
@@ -529,6 +537,8 @@ target_link_libraries(test-rldp2 adnl adnltest dht rldp2 tl_api)
 add_executable(test-validator-session-state test/test-validator-session-state.cpp)
 target_link_libraries(test-validator-session-state adnl dht rldp validatorsession tl_api)
 
+add_executable(test-overlay test/test-overlay.cpp)
+target_link_libraries(test-overlay overlay tdutils tdactor adnl adnltest tl_api dht )
 add_executable(test-catchain test/test-catchain.cpp)
 target_link_libraries(test-catchain overlay tdutils tdactor adnl adnltest rldp tl_api dht
   catchain )
@@ -553,7 +563,7 @@ if (HAS_PARENT)
           ${ED25519_TEST_SOURCE}
           ${TONDB_TEST_SOURCE}
           ${BIGNUM_TEST_SOURCE}
-          ${CELLS_TEST_SOURCE} # ${TONVM_TEST_SOURCE} ${FIFT_TEST_SOURCE} ${TONLIB_ONLINE_TEST_SOURCE}
+          ${CELLS_TEST_SOURCE}
           PARENT_SCOPE)
 endif()
 add_library(all_tests INTERFACE)
@@ -564,7 +574,6 @@ endif()
 enable_testing()
 set(TEST_OPTIONS "--regression ${CMAKE_CURRENT_SOURCE_DIR}/test/regression-tests.ans --filter -Bench")
 separate_arguments(TEST_OPTIONS)
-add_test(test-ed25519-crypto crypto/test-ed25519-crypto)
 add_test(test-ed25519 test-ed25519)
 add_test(test-bigint test-bigint)
 add_test(test-vm test-vm ${TEST_OPTIONS})
@@ -573,6 +582,7 @@ add_test(test-cells test-cells ${TEST_OPTIONS})
 add_test(test-smartcont test-smartcont)
 add_test(test-net test-net)
 add_test(test-actors test-tdactor)
+add_test(test-actors-coro tdactor/test/test-coro)
 add_test(test-emulator test-emulator)
 
 #BEGIN tonlib
@@ -615,6 +625,30 @@ if (NOT NIX)
     else()
         set_property(TEST test-func-legacy PROPERTY ENVIRONMENT
           "FUNC_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/func"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    endif()
+endif()
+
+# Tolk tests
+if (NOT NIX)
+    if (MSVC)
+      set(PYTHON_VER "python")
+    else()
+      set(PYTHON_VER "python3")
+    endif()
+    add_test(
+      NAME test-tolk
+      COMMAND ${PYTHON_VER} tolk-tester.py tests/
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tolk-tester)
+    if (WIN32)
+        set_property(TEST test-tolk PROPERTY ENVIRONMENT
+          "TOLK_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/tolk/tolk.exe"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift.exe"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    else()
+        set_property(TEST test-tolk PROPERTY ENVIRONMENT
+          "TOLK_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/tolk/tolk"
           "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift"
           "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
     endif()

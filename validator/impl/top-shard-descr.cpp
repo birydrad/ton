@@ -39,7 +39,7 @@ ShardTopBlockDescrQ* ShardTopBlockDescrQ::make_copy() const {
 }
 
 td::Status ShardTopBlockDescrQ::unpack_one_proof(BlockIdExt& cur_id, Ref<vm::Cell> proof_root, bool is_head) {
-  auto virt_root = vm::MerkleProof::virtualize(proof_root, 1);
+  auto virt_root = vm::MerkleProof::virtualize(proof_root);
   if (virt_root.is_null()) {
     return td::Status::Error(-666, "link for block "s + cur_id.to_str() + " inside ShardTopBlockDescr of " +
                                        block_id_.to_str() +
@@ -175,9 +175,11 @@ td::Status ShardTopBlockDescrQ::unpack() {
   block::gen::TopBlockDescr::Record rec;
   if (!(block::gen::t_TopBlockDescr.force_validate_ref(root_) && tlb::unpack_cell(root_, rec) &&
         block::tlb::t_BlockIdExt.unpack(rec.proof_for.write(), block_id_))) {
-    std::cerr << "invalid ShardTopBlockDescr: ";
-    block::gen::t_TopBlockDescr.print_ref(std::cerr, root_);
-    vm::load_cell_slice(root_).print_rec(std::cerr);
+    FLOG(INFO) {
+      sb << "invalid ShardTopBlockDescr: ";
+      block::gen::t_TopBlockDescr.print_ref(sb, root_);
+      vm::load_cell_slice(root_).print_rec(sb);
+    };
     return td::Status::Error(-666, "Shard top block description is not a valid TopBlockDescr TL-B object");
   }
   LOG(DEBUG) << "unpacking a ShardTopBlockDescr for " << block_id_.to_str() << " with " << rec.len << " links";
@@ -506,7 +508,7 @@ Ref<block::McShardHash> ShardTopBlockDescrQ::get_prev_descr(int pos, int sum_cnt
       (unsigned)(pos + sum_cnt) > size()) {
     return {};
   }
-  auto virt_root = vm::MerkleProof::virtualize(proof_roots_.at(pos), 1);
+  auto virt_root = vm::MerkleProof::virtualize(proof_roots_.at(pos));
   auto res = block::McShardHash::from_block(std::move(virt_root), chain_blk_ids_.at(pos).file_hash);
   if (res.not_null()) {
     auto& total_fees = res.write().fees_collected_;

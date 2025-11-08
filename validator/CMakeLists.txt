@@ -1,9 +1,3 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
-
-if (NOT OPENSSL_FOUND)
-  find_package(OpenSSL REQUIRED)
-endif()
-
 #add_subdirectory(dummy0)
 add_subdirectory(impl)
 
@@ -16,6 +10,8 @@ set(VALIDATOR_DB_SOURCE
   db/archive-slice.hpp
   db/celldb.cpp
   db/celldb.hpp
+  db/permanent-celldb/permanent-celldb-utils.cpp
+  db/permanent-celldb/permanent-celldb-utils.h
   db/files-async.hpp
   db/fileref.hpp
   db/fileref.cpp
@@ -46,6 +42,7 @@ set(VALIDATOR_HEADERS
   interfaces/db.h
   interfaces/external-message.h
   interfaces/liteserver.h
+  interfaces/out-msg-queue-proof.h
   interfaces/proof.h
   interfaces/shard.h
   interfaces/signature-set.h
@@ -55,8 +52,17 @@ set(VALIDATOR_HEADERS
   invariants.hpp
   
   import-db-slice.hpp
+  import-db-slice-local.hpp
   queue-size-counter.hpp
+  validator-telemetry.hpp
+  storage-stat-cache.hpp
+  shard-block-verifier.hpp
+  shard-block-retainer.hpp
 
+  collation-manager.hpp
+  collator-node/collator-node.hpp
+  collator-node/collator-node-session.hpp
+  collator-node/utils.hpp
   manager-disk.h
   manager-disk.hpp
   manager-init.h
@@ -72,8 +78,13 @@ set(VALIDATOR_HEADERS
 set(VALIDATOR_SOURCE
   apply-block.cpp
   block-handle.cpp
+  collation-manager.cpp
+  collator-node/collator-node.cpp
+  collator-node/collator-node-session.cpp
+  collator-node/utils.cpp
   get-next-key-blocks.cpp
   import-db-slice.cpp
+  import-db-slice-local.cpp
   shard-client.cpp
   state-serializer.cpp
   token-manager.cpp
@@ -82,6 +93,10 @@ set(VALIDATOR_SOURCE
   validator-group.cpp
   validator-options.cpp
   queue-size-counter.cpp
+  validator-telemetry.cpp
+  storage-stat-cache.cpp
+  shard-block-verifier.cpp
+  shard-block-retainer.cpp
 
   downloaders/wait-block-data.cpp
   downloaders/wait-block-state.cpp
@@ -90,8 +105,6 @@ set(VALIDATOR_SOURCE
 
   manager-init.cpp
   manager.cpp
-
-  ${VALIDATOR_DB_SOURCE}
 
   ${VALIDATOR_HEADERS}
 )
@@ -112,8 +125,6 @@ set(DISK_VALIDATOR_SOURCE
 
   manager-init.cpp
   manager-disk.cpp
-
-  ${VALIDATOR_DB_SOURCE}
 )
 
 set(HARDFORK_VALIDATOR_SOURCE
@@ -132,8 +143,6 @@ set(HARDFORK_VALIDATOR_SOURCE
 
   manager-init.cpp
   manager-hardfork.cpp
-
-  ${VALIDATOR_DB_SOURCE}
 )
 
 set(FULL_NODE_SOURCE
@@ -150,6 +159,8 @@ set(FULL_NODE_SOURCE
   full-node-private-overlay.cpp
   full-node-serializer.hpp
   full-node-serializer.cpp
+  full-node-fast-sync-overlays.hpp
+  full-node-fast-sync-overlays.cpp
 
   net/download-block.hpp
   net/download-block.cpp
@@ -166,6 +177,10 @@ set(FULL_NODE_SOURCE
   net/get-next-key-blocks.hpp
   net/get-next-key-blocks.cpp
 )
+
+add_library(validator-db OBJECT ${VALIDATOR_DB_SOURCE})
+target_include_directories(validator-db PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_link_libraries(validator-db PUBLIC tdactor adnl rldp tl_api dht tdfec overlay catchain validatorsession ton_db)
 
 add_library(validator STATIC ${VALIDATOR_SOURCE})
 add_library(validator-disk STATIC ${DISK_VALIDATOR_SOURCE})
@@ -200,14 +215,10 @@ target_include_directories(full-node PUBLIC
   ${OPENSSL_INCLUDE_DIR}
   )
 
-target_link_libraries(validator PRIVATE tdutils tdactor adnl rldp tl_api dht tdfec
-  overlay catchain validatorsession ton_crypto ton_block ton_db)
+target_link_libraries(validator PRIVATE validator-db)
 
-target_link_libraries(validator-disk PRIVATE tdutils tdactor adnl rldp tl_api dht tdfec
-  overlay catchain validatorsession ton_crypto ton_block ton_db)
+target_link_libraries(validator-disk PRIVATE validator-db)
 
-target_link_libraries(validator-hardfork PRIVATE tdutils tdactor adnl rldp tl_api dht tdfec
-  overlay catchain validatorsession ton_crypto ton_block ton_db)
+target_link_libraries(validator-hardfork PRIVATE validator-db)
 
-target_link_libraries(full-node PRIVATE tdutils tdactor adnl rldp rldp2 tl_api dht tdfec
-  overlay catchain validatorsession ton_crypto ton_block ton_db)
+target_link_libraries(full-node PRIVATE tdactor adnl rldp rldp2 tl_api dht tdfec overlay catchain validatorsession ton_db)

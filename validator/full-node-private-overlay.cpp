@@ -19,6 +19,9 @@
 #include "common/delay.h"
 #include "common/checksum.h"
 #include "full-node-serializer.hpp"
+#include "auto/tl/ton_api_json.h"
+#include "td/utils/JsonBuilder.h"
+#include "tl/tl_json.h"
 
 namespace ton::validator::fullnode {
 
@@ -28,6 +31,11 @@ void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src, ton_api::
 
 void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src,
                                                     ton_api::tonNode_blockBroadcastCompressed &query) {
+  process_block_broadcast(src, query);
+}
+
+void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src,
+                                                    ton_api::tonNode_blockBroadcastCompressedV2 &query) {
   process_block_broadcast(src, query);
 }
 
@@ -46,8 +54,8 @@ void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src, ton_api::
   BlockIdExt block_id = create_block_id(query.block_->block_);
   VLOG(FULL_NODE_DEBUG) << "Received newShardBlockBroadcast in private overlay from " << src << ": "
                         << block_id.to_str();
-  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::new_shard_block, block_id,
-                          query.block_->cc_seqno_, std::move(query.block_->data_));
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::new_shard_block_description_broadcast,
+                          block_id, query.block_->cc_seqno_, std::move(query.block_->data_));
 }
 
 void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src,
@@ -57,6 +65,11 @@ void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src,
 
 void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src,
                                                     ton_api::tonNode_newBlockCandidateBroadcastCompressed &query) {
+  process_block_candidate_broadcast(src, query);
+}
+
+void FullNodePrivateBlockOverlay::process_broadcast(PublicKeyHash src,
+                                                    ton_api::tonNode_newBlockCandidateBroadcastCompressedV2 &query) {
   process_block_candidate_broadcast(src, query);
 }
 
@@ -85,12 +98,45 @@ void FullNodePrivateBlockOverlay::process_block_candidate_broadcast(PublicKeyHas
                           validator_set_hash, std::move(data));
 }
 
+void FullNodePrivateBlockOverlay::process_telemetry_broadcast(
+    PublicKeyHash src, const tl_object_ptr<ton_api::validator_telemetry> &telemetry) {
+  if (telemetry->adnl_id_ != src.bits256_value()) {
+    VLOG(FULL_NODE_WARNING) << "Invalid telemetry broadcast from " << src << ": adnl_id mismatch";
+    return;
+  }
+  auto now = (td::int32)td::Clocks::system();
+  if (telemetry->timestamp_ < now - 60) {
+    VLOG(FULL_NODE_WARNING) << "Invalid telemetry broadcast from " << src << ": too old ("
+                            << now - telemetry->timestamp_ << "s ago)";
+    return;
+  }
+  if (telemetry->timestamp_ > now + 60) {
+    VLOG(FULL_NODE_WARNING) << "Invalid telemetry broadcast from " << src << ": too new ("
+                            << telemetry->timestamp_ - now << "s in the future)";
+    return;
+  }
+  VLOG(FULL_NODE_DEBUG) << "Got telemetry broadcast from " << src;
+  auto s = td::json_encode<std::string>(td::ToJson(*telemetry), false);
+  std::erase_if(s, [](char c) { return c == '\n' || c == '\r'; });
+  telemetry_file_ << s << "\n";
+  telemetry_file_.flush();
+  if (telemetry_file_.fail()) {
+    VLOG(FULL_NODE_WARNING) << "Failed to write telemetry to file";
+  }
+}
+
 void FullNodePrivateBlockOverlay::receive_broadcast(PublicKeyHash src, td::BufferSlice broadcast) {
   if (adnl::AdnlNodeIdShort{src} == local_id_) {
     return;
   }
   auto B = fetch_tl_object<ton_api::tonNode_Broadcast>(std::move(broadcast), true);
   if (B.is_error()) {
+    if (collect_telemetry_ && src != local_id_.pubkey_hash()) {
+      auto R = fetch_tl_prefix<ton_api::validator_telemetry>(broadcast, true);
+      if (R.is_ok()) {
+        process_telemetry_broadcast(src, R.ok());
+      }
+    }
     return;
   }
   ton_api::downcast_call(*B.move_as_ok(), [src, Self = this](auto &obj) { Self->process_broadcast(src, obj); });
@@ -142,6 +188,32 @@ void FullNodePrivateBlockOverlay::send_broadcast(BlockBroadcast broadcast) {
   }
   td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, local_id_, overlay_id_,
                           local_id_.pubkey_hash(), overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+}
+
+void FullNodePrivateBlockOverlay::send_validator_telemetry(tl_object_ptr<ton_api::validator_telemetry> telemetry) {
+  if (collect_telemetry_) {
+    process_telemetry_broadcast(local_id_.pubkey_hash(), telemetry);
+  }
+  auto data = serialize_tl_object(telemetry, true);
+  if (data.size() <= overlay::Overlays::max_simple_broadcast_size()) {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, local_id_, overlay_id_,
+                            local_id_.pubkey_hash(), 0, std::move(data));
+  } else {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, local_id_, overlay_id_,
+                            local_id_.pubkey_hash(), 0, std::move(data));
+  }
+}
+
+void FullNodePrivateBlockOverlay::collect_validator_telemetry(std::string filename) {
+  if (collect_telemetry_) {
+    telemetry_file_.close();
+  }
+  collect_telemetry_ = true;
+  LOG(FULL_NODE_WARNING) << "Collecting validator telemetry to " << filename << " (local id: " << local_id_ << ")";
+  telemetry_file_.open(filename, std::ios_base::app);
+  if (!telemetry_file_.is_open()) {
+    LOG(WARNING) << "Cannot open file " << filename << " for validator telemetry";
+  }
 }
 
 void FullNodePrivateBlockOverlay::start_up() {
@@ -200,12 +272,30 @@ void FullNodePrivateBlockOverlay::init() {
   overlay::OverlayPrivacyRules rules{overlay::Overlays::max_fec_broadcast_size(),
                                      overlay::CertificateFlags::AllowFec | overlay::CertificateFlags::Trusted,
                                      {}};
-  td::actor::send_closure(overlays_, &overlay::Overlays::create_private_overlay, local_id_, overlay_id_full_.clone(),
-                          nodes_, std::make_unique<Callback>(actor_id(this)), rules, R"({ "type": "private-blocks" })");
+  overlay::OverlayOptions overlay_options;
+  overlay_options.broadcast_speed_multiplier_ = opts_.private_broadcast_speed_multiplier_;
+  overlay_options.private_ping_peers_ = true;
+  td::actor::send_closure(overlays_, &overlay::Overlays::create_private_overlay_ex, local_id_, overlay_id_full_.clone(),
+                          nodes_, std::make_unique<Callback>(actor_id(this)), rules, R"({ "type": "private-blocks" })",
+                          overlay_options);
 
   td::actor::send_closure(rldp_, &rldp::Rldp::add_id, local_id_);
   td::actor::send_closure(rldp2_, &rldp2::Rldp::add_id, local_id_);
   inited_ = true;
+
+  class TelemetryCallback : public ValidatorTelemetry::Callback {
+   public:
+    explicit TelemetryCallback(td::actor::ActorId<FullNodePrivateBlockOverlay> id) : id_(id) {
+    }
+    void send_telemetry(tl_object_ptr<ton_api::validator_telemetry> telemetry) override {
+      td::actor::send_closure(id_, &FullNodePrivateBlockOverlay::send_validator_telemetry, std::move(telemetry));
+    }
+
+   private:
+    td::actor::ActorId<FullNodePrivateBlockOverlay> id_;
+  };
+  telemetry_sender_ = td::actor::create_actor<ValidatorTelemetry>("telemetry", local_id_,
+                                                                  std::make_unique<TelemetryCallback>(actor_id(this)));
 }
 
 void FullNodePrivateBlockOverlay::tear_down() {
@@ -219,6 +309,10 @@ void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src, ton_api::tonNod
 }
 
 void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcastCompressed &query) {
+  process_block_broadcast(src, query);
+}
+
+void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src, ton_api::tonNode_blockBroadcastCompressedV2 &query) {
   process_block_broadcast(src, query);
 }
 
@@ -257,6 +351,11 @@ void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src, ton_api::tonNod
 
 void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src,
                                               ton_api::tonNode_newBlockCandidateBroadcastCompressed &query) {
+  process_block_candidate_broadcast(src, query);
+}
+
+void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src,
+                                              ton_api::tonNode_newBlockCandidateBroadcastCompressedV2 &query) {
   process_block_candidate_broadcast(src, query);
 }
 
@@ -302,7 +401,7 @@ void FullNodeCustomOverlay::receive_broadcast(PublicKeyHash src, td::BufferSlice
 }
 
 void FullNodeCustomOverlay::send_external_message(td::BufferSlice data) {
-  if (!inited_ || config_.ext_messages_broadcast_disabled_) {
+  if (!inited_ || opts_.config_.ext_messages_broadcast_disabled_) {
     return;
   }
   VLOG(FULL_NODE_DEBUG) << "Sending external message to custom overlay \"" << name_ << "\"";
@@ -408,10 +507,13 @@ void FullNodeCustomOverlay::init() {
     authorized_keys[sender.pubkey_hash()] = overlay::Overlays::max_fec_broadcast_size();
   }
   overlay::OverlayPrivacyRules rules{overlay::Overlays::max_fec_broadcast_size(), 0, std::move(authorized_keys)};
+  overlay::OverlayOptions overlay_options;
+  overlay_options.broadcast_speed_multiplier_ = opts_.private_broadcast_speed_multiplier_;
   td::actor::send_closure(
-      overlays_, &overlay::Overlays::create_private_overlay, local_id_, overlay_id_full_.clone(), nodes_,
+      overlays_, &overlay::Overlays::create_private_overlay_ex, local_id_, overlay_id_full_.clone(), nodes_,
       std::make_unique<Callback>(actor_id(this)), rules,
-      PSTRING() << R"({ "type": "custom-overlay", "name": ")" << td::format::Escaped{name_} << R"(" })");
+      PSTRING() << R"({ "type": "custom-overlay", "name": ")" << td::format::Escaped{name_} << R"(" })",
+      overlay_options);
 
   td::actor::send_closure(rldp_, &rldp::Rldp::add_id, local_id_);
   td::actor::send_closure(rldp2_, &rldp2::Rldp::add_id, local_id_);

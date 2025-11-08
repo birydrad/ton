@@ -28,7 +28,7 @@
 #include "td/utils/Container.h"
 #include "td/utils/Random.h"
 
-#include "ExtClientLazy.h"
+#include "lite-client/ext-client.h"
 #include "TonlibError.h"
 #include "utils.h"
 
@@ -38,7 +38,7 @@ class LastConfig;
 struct LastBlockState;
 struct LastConfigState;
 struct ExtClientRef {
-  td::actor::ActorId<ExtClientLazy> adnl_ext_client_;
+  td::actor::ActorId<liteclient::ExtClient> adnl_ext_client_;
   td::actor::ActorId<LastBlock> last_block_actor_;
   td::actor::ActorId<LastConfig> last_config_actor_;
 };
@@ -79,6 +79,7 @@ class ExtClient {
     send_raw_query(
         std::move(liteserver_query), [promise = std::move(promise), tag](td::Result<td::BufferSlice> R) mutable {
           auto res = [&]() -> td::Result<typename QueryT::ReturnType> {
+            LOG_IF(ERROR, R.is_error()) << "failed to send query to liteserver: " << R.error();
             TRY_RESULT_PREFIX(data, std::move(R), TonlibError::LiteServerNetwork());
             auto r_error = ton::fetch_tl_object<ton::lite_api::liteServer_error>(data.clone(), true);
             if (r_error.is_ok()) {
@@ -97,7 +98,7 @@ class ExtClient {
 
   void force_change_liteserver() {
     if (!client_.adnl_ext_client_.empty()) {
-      td::actor::send_closure(client_.adnl_ext_client_, &ExtClientLazy::force_change_liteserver);
+      td::actor::send_closure(client_.adnl_ext_client_, &liteclient::ExtClient::reset_servers);
     }
   }
 

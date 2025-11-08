@@ -55,10 +55,8 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <limits>
 #include <memory>
 #include <mutex>
-#include <type_traits>
 #include <utility>
 
 namespace td {
@@ -130,27 +128,20 @@ struct LocalQueue {
  public:
   template <class F>
   bool push(T value, F &&overflow_f) {
-    auto res = std::move(next_);
-    next_ = std::move(value);
-    if (res) {
-      queue_.local_push(res.unwrap(), overflow_f);
-      return true;
-    }
-    return false;
-  }
-  bool try_pop(T &message) {
-    if (!next_) {
-      return queue_.local_pop(message);
-    }
-    message = next_.unwrap();
+    queue_.local_push(std::move(value), overflow_f);
     return true;
   }
-  bool steal(T &message, LocalQueue<T> &other) {
+  bool try_pop(T &message) {
+    return queue_.local_pop(message);
+  }
+  bool steal(T &message, LocalQueue &other) {
     return queue_.steal(message, other.queue_);
+  }
+  size_t size() const {
+    return queue_.size();
   }
 
  private:
-  td::optional<T> next_;
   StealingQueue<T> queue_;
   char pad[TD_CONCURRENCY_PAD - sizeof(optional<T>)];
 };
@@ -158,10 +149,10 @@ struct LocalQueue {
 struct SchedulerInfo {
   SchedulerId id;
   // will be read by all workers is any thread
-  std::unique_ptr<MpmcQueue<SchedulerMessage::Raw *>> cpu_queue;
+  std::unique_ptr<MpmcQueue<SchedulerToken>> cpu_queue;
   std::unique_ptr<MpmcWaiter> cpu_queue_waiter;
 
-  std::vector<LocalQueue<SchedulerMessage::Raw *>> cpu_local_queue;
+  std::vector<LocalQueue<SchedulerToken>> cpu_local_queue;
   //std::vector<td::StealingQueue<SchedulerMessage>> cpu_stealing_queue;
 
   // only scheduler itself may read from io_queue_
@@ -251,6 +242,7 @@ class Scheduler {
 
     SchedulerId get_scheduler_id() const override;
     void add_to_queue(ActorInfoPtr actor_info_ptr, SchedulerId scheduler_id, bool need_poll) override;
+    void add_token_to_cpu_queue(SchedulerToken token, SchedulerId scheduler_id) override;
 
     ActorInfoCreator &get_actor_info_creator() override;
 
@@ -267,10 +259,11 @@ class Scheduler {
     bool is_stop_requested() override;
     void stop() override;
 
-   private:
-    SchedulerGroupInfo *scheduler_group() const {
+    SchedulerGroupInfo *scheduler_group() const override {
       return scheduler_group_;
     }
+
+   private:
 
     ActorInfoCreator *creator_;
     SchedulerId scheduler_id_;

@@ -85,15 +85,9 @@ void LiteQuery::abort_query(td::Status reason) {
   if (acc_state_promise_) {
     acc_state_promise_.set_error(std::move(reason));
   } else if (promise_) {
+    td::actor::send_closure(manager_, &ValidatorManager::add_lite_query_stats, query_obj_ ? query_obj_->get_id() : 0,
+                            false);
     promise_.set_error(std::move(reason));
-  }
-  stop();
-}
-
-void LiteQuery::abort_query_ext(td::Status reason, std::string comment) {
-  LOG(INFO) << "aborted liteserver query: " << comment << " : " << reason.to_string();
-  if (promise_) {
-    promise_.set_error(reason.move_as_error_prefix(comment + " : "));
   }
   stop();
 }
@@ -120,6 +114,8 @@ bool LiteQuery::finish_query(td::BufferSlice result, bool skip_cache_update) {
     td::actor::send_closure(cache_, &LiteServerCache::update, cache_key_, result.clone());
   }
   if (promise_) {
+    td::actor::send_closure(manager_, &ValidatorManager::add_lite_query_stats, query_obj_ ? query_obj_->get_id() : 0,
+                            true);
     promise_.set_result(std::move(result));
     stop();
     return true;
@@ -139,7 +135,6 @@ void LiteQuery::start_up() {
 
   auto F = fetch_tl_object<ton::lite_api::Function>(query_, true);
   if (F.is_error()) {
-    td::actor::send_closure(manager_, &ValidatorManager::add_lite_query_stats, 0);  // unknown
     abort_query(F.move_as_error());
     return;
   }
@@ -192,7 +187,6 @@ bool LiteQuery::use_cache()  {
 }
 
 void LiteQuery::perform() {
-  td::actor::send_closure(manager_, &ValidatorManager::add_lite_query_stats, query_obj_->get_id());
   lite_api::downcast_call(
       *query_obj_,
       td::overloaded(
@@ -289,6 +283,13 @@ void LiteQuery::perform() {
           },
           [&](lite_api::liteServer_getBlockOutMsgQueueSize& q) {
             this->perform_getBlockOutMsgQueueSize(q.mode_, create_block_id(q.id_));
+          },
+          [&](lite_api::liteServer_getDispatchQueueInfo& q) {
+            this->perform_getDispatchQueueInfo(q.mode_, create_block_id(q.id_), q.after_addr_, q.max_accounts_);
+          },
+          [&](lite_api::liteServer_getDispatchQueueMessages& q) {
+            this->perform_getDispatchQueueMessages(q.mode_, create_block_id(q.id_), q.addr_,
+                                                   std::max<td::int64>(q.after_lt_, 0), q.max_messages_);
           },
           [&](auto& obj) { this->abort_query(td::Status::Error(ErrorCode::protoviolation, "unknown query")); }));
 }
@@ -916,7 +917,8 @@ void LiteQuery::continue_getLibraries(Ref<ton::validator::MasterchainState> mc_s
   mc_state_ = Ref<MasterchainStateQ>(std::move(mc_state));
   CHECK(mc_state_.not_null());
 
-  auto rconfig = block::ConfigInfo::extract_config(mc_state_->root_cell(), block::ConfigInfo::needLibraries);
+  auto rconfig = block::ConfigInfo::extract_config(mc_state_->root_cell(), mc_state_->get_block_id(),
+                                                   block::ConfigInfo::needLibraries);
   if (rconfig.is_error()) {
     fatal_error("cannot extract library list block configuration from masterchain state");
     return;
@@ -1250,9 +1252,10 @@ bool LiteQuery::make_shard_info_proof(Ref<vm::Cell>& proof, BlockIdExt& blkid, A
   return true;
 }
 
-bool LiteQuery::make_ancestor_block_proof(Ref<vm::Cell>& proof, Ref<vm::Cell> state_root, const BlockIdExt& old_blkid) {
-  vm::MerkleProofBuilder mpb{std::move(state_root)};
-  auto rconfig = block::ConfigInfo::extract_config(mpb.root(), block::ConfigInfo::needPrevBlocks);
+bool LiteQuery::make_ancestor_block_proof(Ref<vm::Cell>& proof, Ref<MasterchainState> mc_state, const BlockIdExt& old_blkid) {
+  vm::MerkleProofBuilder mpb{mc_state->root_cell()};
+  auto rconfig =
+      block::ConfigInfo::extract_config(mpb.root(), mc_state->get_block_id(), block::ConfigInfo::needPrevBlocks);
   if (rconfig.is_error()) {
     return fatal_error(
         "cannot extract previous block configuration from masterchain state while constructing Merkle proof for "s +
@@ -1318,13 +1321,12 @@ void LiteQuery::finish_getAccountState(td::BufferSlice shard_proof) {
   vm::AugmentedDictionary accounts_dict{vm::load_cell_slice_ref(sstate.accounts), 256, block::tlb::aug_ShardAccounts};
   auto acc_csr = accounts_dict.lookup(acc_addr_);
   if (mode_ & 0x80000000) {
-    auto config = block::ConfigInfo::extract_config(mc_state_->root_cell(), 0xFFFF);
+    auto config = block::ConfigInfo::extract_config(mc_state_->root_cell(), mc_state_->get_block_id(), 0xFFFF);
     if (config.is_error()) {
       fatal_error(config.move_as_error());
       return;
     }
     auto rconfig = config.move_as_ok();
-    rconfig->set_block_id_ext(mc_state_->get_block_id());
     acc_state_promise_.set_value(std::make_tuple(
                                   std::move(acc_csr), sstate.gen_utime, sstate.gen_lt, std::move(rconfig)
                                  ));
@@ -1370,13 +1372,9 @@ void LiteQuery::finish_getAccountState(td::BufferSlice shard_proof) {
   if (acc_root.not_null()) {
     if (mode_ & 0x40000000) {
       vm::MerkleProofBuilder mpb{acc_root};
-      // account_none$0 = Account;
-      // account$1 addr:MsgAddressInt storage_stat:StorageInfo storage:AccountStorage = Account;
-      // account_storage$_ last_trans_lt:uint64 balance:CurrencyCollection state:AccountState = AccountStorage;
-      // account_active$1 _:StateInit = AccountState;
-      auto S = mpb.root()->load_cell();
-      if (S.is_error()) {
-        fatal_error(S.move_as_error_prefix("Failed to load account: "));
+      // This does not include code, data and libs into proof, but it includes extra currencies
+      if (!block::gen::t_Account.validate_ref(mpb.root())) {
+        fatal_error("failed to validate Account");
         return;
       }
       if (!mpb.extract_proof_to(acc_root)) {
@@ -1435,12 +1433,15 @@ static td::Ref<vm::Tuple> prepare_vm_c7(ton::UnixTime now, ton::LogicalTime lt, 
   if (config && config->get_global_version() >= 6) {
     tuple.push_back(vm::StackEntry::maybe(config->get_unpacked_config_tuple(now)));  // unpacked_config_tuple:[...]
     tuple.push_back(due_payment);                                                    // due_payment:Integer
-    // precomiled_gas_usage:(Maybe Integer)
+    // precompiled_gas_usage:(Maybe Integer)
     td::optional<block::PrecompiledContractsConfig::Contract> precompiled;
     if (my_code.not_null()) {
       precompiled = config->get_precompiled_contracts_config().get_contract(my_code->get_hash().bits());
     }
     tuple.push_back(precompiled ? td::make_refint(precompiled.value().gas_usage) : vm::StackEntry());
+  }
+  if (config && config->get_global_version() >= 11) {
+    tuple.push_back(block::transaction::Transaction::prepare_in_msg_params_tuple(nullptr, {}, {}));
   }
   auto tuple_ref = td::make_cnt_ref<std::vector<vm::StackEntry>>(std::move(tuple));
   LOG(DEBUG) << "SmartContractInfo initialized with " << vm::StackEntry(tuple_ref).to_string();
@@ -1502,7 +1503,7 @@ void LiteQuery::finish_runSmcMethod(td::BufferSlice shard_proof, td::BufferSlice
   LOG(DEBUG) << "creating VM with gas limit " << gas_limit;
   // **** INIT VM ****
   auto r_config = block::ConfigInfo::extract_config(
-      mc_state_->root_cell(),
+      mc_state_->root_cell(), mc_state_->get_block_id(),
       block::ConfigInfo::needLibraries | block::ConfigInfo::needCapabilities | block::ConfigInfo::needPrevBlocks);
   if (r_config.is_error()) {
     fatal_error(r_config.move_as_error());
@@ -1517,11 +1518,17 @@ void LiteQuery::finish_runSmcMethod(td::BufferSlice shard_proof, td::BufferSlice
     libraries.push_back(acc_libs);
   }
   vm::GasLimits gas{gas_limit, gas_limit};
-  vm::VmState vm{code, std::move(stack_), gas, 1, std::move(data), vm::VmLog::Null(), std::move(libraries)};
+  vm::VmState vm{code,
+                 config->get_global_version(),
+                 std::move(stack_),
+                 gas,
+                 1,
+                 std::move(data),
+                 vm::VmLog::Null(),
+                 std::move(libraries)};
   auto c7 = prepare_vm_c7(gen_utime, gen_lt, td::make_ref<vm::CellSlice>(acc.addr->clone()), balance, config.get(),
                           std::move(code), due_payment);
   vm.set_c7(c7);  // tuple with SmartContractInfo
-  vm.set_global_version(config->get_global_version());
   // vm.incr_stack_trace(1);    // enable stack dump after each step
   LOG(INFO) << "starting VM to run GET-method of smart contract " << acc_workchain_ << ":" << acc_addr_.to_hex();
   // **** RUN VM ****
@@ -1853,7 +1860,7 @@ void LiteQuery::perform_getConfigParams(BlockIdExt blkid, int mode, std::vector<
     request_mc_block_data_state(blkid);
   } else {
     // get configuration from previous key block
-    load_prevKeyBlock(blkid, [this, blkid, mode, param_list = std::move(param_list)](
+    load_prevKeyBlock(blkid, [this, mode, param_list = std::move(param_list)](
                                  td::Result<std::pair<BlockIdExt, Ref<BlockQ>>> res) mutable {
       if (res.is_error()) {
         this->abort_query(res.move_as_error());
@@ -1896,7 +1903,10 @@ void LiteQuery::continue_getConfigParams(int mode, std::vector<int> param_list) 
     }
     cfg = res.move_as_ok();
   } else {
-    auto res = block::ConfigInfo::extract_config(mpb.root(), mode);
+    if (mode & block::ConfigInfo::needPrevBlocks) {
+      mode |= block::ConfigInfo::needCapabilities;
+    }
+    auto res = block::ConfigInfo::extract_config(mpb.root(), keyblk ? base_blk_id_ : mc_state_->get_block_id(), mode);
     if (res.is_error()) {
       fatal_error(res.move_as_error());
       return;
@@ -2050,7 +2060,7 @@ void LiteQuery::perform_lookupBlockWithProof(BlockId blkid, BlockIdExt mc_blkid,
 
   ton::AccountIdPrefixFull pfx{blkid.workchain, blkid.shard};
   auto P = td::PromiseCreator::lambda(
-    [Self = actor_id(this), mc_blkid, manager = manager_, mode, pfx](td::Result<ConstBlockHandle> res) {
+    [Self = actor_id(this), mc_blkid, manager = manager_, pfx](td::Result<ConstBlockHandle> res) {
       if (res.is_error()) {
         td::actor::send_closure(Self, &LiteQuery::abort_query, res.move_as_error());
         return;
@@ -2066,7 +2076,7 @@ void LiteQuery::perform_lookupBlockWithProof(BlockId blkid, BlockIdExt mc_blkid,
       }
       LOG(DEBUG) << "requesting data for block " << handle->id().to_str();
       td::actor::send_closure_later(manager, &ValidatorManager::get_block_data_from_db, handle,
-                                    [Self, mc_ref_blkid = handle->masterchain_ref_block(), mc_blkid, pfx, mode](td::Result<Ref<BlockData>> res) {
+                                    [Self, mc_ref_blkid = handle->masterchain_ref_block(), pfx](td::Result<Ref<BlockData>> res) {
         if (res.is_error()) {
           td::actor::send_closure(Self, &LiteQuery::abort_query, res.move_as_error());
         } else {
@@ -2381,7 +2391,8 @@ void LiteQuery::perform_listBlockTransactions(BlockIdExt blkid, int mode, int co
 
 static td::Result<tl_object_ptr<lite_api::liteServer_transactionMetadata>> get_in_msg_metadata(
     const Ref<vm::Cell>& in_msg_descr_root, const Ref<vm::Cell>& trans_root) {
-  vm::AugmentedDictionary in_msg_descr{vm::load_cell_slice_ref(in_msg_descr_root), 256, block::tlb::aug_InMsgDescr};
+  vm::AugmentedDictionary in_msg_descr{vm::load_cell_slice_ref(in_msg_descr_root), 256,
+                                       block::tlb::aug_InMsgDescrDefault};
   block::gen::Transaction::Record transaction;
   if (!block::tlb::unpack_cell(trans_root, transaction)) {
     return td::Status::Error("invalid Transaction in block");
@@ -2540,7 +2551,8 @@ void LiteQuery::perform_listBlockTransactionsExt(BlockIdExt blkid, int mode, int
 
 static td::Status process_all_in_msg_metadata(const Ref<vm::Cell>& in_msg_descr_root,
                                               const std::vector<Ref<vm::Cell>>& trans_roots) {
-  vm::AugmentedDictionary in_msg_descr{vm::load_cell_slice_ref(in_msg_descr_root), 256, block::tlb::aug_InMsgDescr};
+  vm::AugmentedDictionary in_msg_descr{vm::load_cell_slice_ref(in_msg_descr_root), 256,
+                                       block::tlb::aug_InMsgDescrDefault};
   for (const Ref<vm::Cell>& trans_root : trans_roots) {
     block::gen::Transaction::Record transaction;
     if (!block::tlb::unpack_cell(trans_root, transaction)) {
@@ -3036,7 +3048,7 @@ bool LiteQuery::construct_proof_link_back_cont(ton::BlockIdExt cur, ton::BlockId
       return fatal_error("cannot construct proof for state of masterchain block "s + cur.to_str());
     }
     // construct proof that `next` is listed in OldMcBlocksInfo of `mc_state_`
-    if (!make_ancestor_block_proof(state_proof, mc_state_->root_cell(), next)) {
+    if (!make_ancestor_block_proof(state_proof, mc_state_, next)) {
       return fatal_error("cannot prove that "s + next.to_str() +
                          " is in the previous block set of the masterchain state of " + cur.to_str());
     }
@@ -3432,6 +3444,248 @@ void LiteQuery::finish_getBlockOutMsgQueueSize() {
   finish_query(std::move(b));
 }
 
+void LiteQuery::perform_getDispatchQueueInfo(int mode, BlockIdExt blkid, StdSmcAddress after_addr, int max_accounts) {
+  LOG(INFO) << "started a getDispatchQueueInfo(" << blkid.to_str() << ", " << mode << ") liteserver query";
+  mode_ = mode;
+  if (!blkid.is_valid_full()) {
+    fatal_error("invalid BlockIdExt");
+    return;
+  }
+  if (max_accounts <= 0) {
+    fatal_error("invalid max_accounts");
+    return;
+  }
+  set_continuation([=]() -> void { finish_getDispatchQueueInfo(after_addr, max_accounts); });
+  request_block_data_state(blkid);
+}
+
+void LiteQuery::finish_getDispatchQueueInfo(StdSmcAddress after_addr, int max_accounts) {
+  LOG(INFO) << "completing getDispatchQueueInfo() query";
+  bool with_proof = mode_ & 1;
+  Ref<vm::Cell> state_root = state_->root_cell();
+  vm::MerkleProofBuilder pb;
+  if (with_proof) {
+    pb = vm::MerkleProofBuilder{state_root};
+    state_root = pb.root();
+  }
+
+  std::unique_ptr<vm::AugmentedDictionary> dispatch_queue;
+
+  block::gen::ShardStateUnsplit::Record sstate;
+  block::gen::OutMsgQueueInfo::Record out_msg_queue_info;
+  block::gen::OutMsgQueueExtra::Record out_msg_queue_extra;
+  if (!tlb::unpack_cell(state_root, sstate) || !tlb::unpack_cell(sstate.out_msg_queue_info, out_msg_queue_info)) {
+    fatal_error("cannot unpack shard state");
+    return;
+  }
+  vm::CellSlice& extra_slice = out_msg_queue_info.extra.write();
+  if (extra_slice.fetch_long(1)) {
+    if (!tlb::unpack(extra_slice, out_msg_queue_extra)) {
+      fatal_error("cannot unpack OutMsgQueueExtra");
+      return;
+    }
+    dispatch_queue = std::make_unique<vm::AugmentedDictionary>(out_msg_queue_extra.dispatch_queue, 256,
+                                                               block::tlb::aug_DispatchQueue);
+  } else {
+    dispatch_queue = std::make_unique<vm::AugmentedDictionary>(256, block::tlb::aug_DispatchQueue);
+  }
+
+  int remaining = std::min(max_accounts, 64);
+  bool complete = false;
+  std::vector<tl_object_ptr<lite_api::liteServer_accountDispatchQueueInfo>> result;
+  bool allow_eq;
+  if (mode_ & 2) {
+    allow_eq = false;
+  } else {
+    allow_eq = true;
+    after_addr = td::Bits256::zero();
+  }
+  while (true) {
+    auto value = dispatch_queue->extract_value(dispatch_queue->lookup_nearest_key(after_addr, true, allow_eq));
+    allow_eq = false;
+    if (value.is_null()) {
+      complete = true;
+      break;
+    }
+    if (remaining == 0) {
+      break;
+    }
+    --remaining;
+    StdSmcAddress addr = after_addr;
+    vm::Dictionary dict{64};
+    td::uint64 dict_size;
+    if (!block::unpack_account_dispatch_queue(value, dict, dict_size)) {
+      fatal_error(PSTRING() << "invalid account dispatch queue for account " << addr.to_hex());
+      return;
+    }
+    CHECK(dict_size > 0);
+    td::BitArray<64> min_lt, max_lt;
+    dict.get_minmax_key(min_lt.bits(), 64, false, false);
+    dict.get_minmax_key(max_lt.bits(), 64, true, false);
+    result.push_back(create_tl_object<lite_api::liteServer_accountDispatchQueueInfo>(addr, dict_size, min_lt.to_ulong(),
+                                                                                     max_lt.to_ulong()));
+  }
+
+  td::BufferSlice proof;
+  if (with_proof) {
+    Ref<vm::Cell> proof1, proof2;
+    if (!make_state_root_proof(proof1)) {
+      return;
+    }
+    if (!pb.extract_proof_to(proof2)) {
+      fatal_error("unknown error creating Merkle proof");
+      return;
+    }
+    auto r_proof = vm::std_boc_serialize_multi({std::move(proof1), std::move(proof2)});
+    if (r_proof.is_error()) {
+      fatal_error(r_proof.move_as_error());
+      return;
+    }
+    proof = r_proof.move_as_ok();
+  }
+  LOG(INFO) << "getDispatchQueueInfo(" << blk_id_.to_str() << ", " << mode_ << ") query completed";
+  auto b = ton::create_serialize_tl_object<ton::lite_api::liteServer_dispatchQueueInfo>(
+      mode_, ton::create_tl_lite_block_id(blk_id_), std::move(result), complete, std::move(proof));
+  finish_query(std::move(b));
+}
+
+void LiteQuery::perform_getDispatchQueueMessages(int mode, BlockIdExt blkid, StdSmcAddress addr, LogicalTime lt,
+                                                 int max_messages) {
+  LOG(INFO) << "started a getDispatchQueueMessages(" << blkid.to_str() << ", " << mode << ") liteserver query";
+  mode_ = mode;
+  if (!blkid.is_valid_full()) {
+    fatal_error("invalid BlockIdExt");
+    return;
+  }
+  if (max_messages <= 0) {
+    fatal_error("invalid max_messages");
+    return;
+  }
+  set_continuation([=]() -> void { finish_getDispatchQueueMessages(addr, lt, max_messages); });
+  request_block_data_state(blkid);
+}
+
+void LiteQuery::finish_getDispatchQueueMessages(StdSmcAddress addr, LogicalTime lt, int max_messages) {
+  LOG(INFO) << "completing getDispatchQueueMessages() query";
+  bool with_proof = mode_ & lite_api::liteServer_getDispatchQueueMessages::WANT_PROOF_MASK;
+  bool one_account = mode_ & lite_api::liteServer_getDispatchQueueMessages::ONE_ACCOUNT_MASK;
+  bool with_messages_boc = mode_ & lite_api::liteServer_getDispatchQueueMessages::MESSAGES_BOC_MASK;
+  Ref<vm::Cell> state_root = state_->root_cell();
+  vm::MerkleProofBuilder pb;
+  if (with_proof) {
+    pb = vm::MerkleProofBuilder{state_root};
+    state_root = pb.root();
+  }
+
+  std::unique_ptr<vm::AugmentedDictionary> dispatch_queue;
+
+  block::gen::ShardStateUnsplit::Record sstate;
+  block::gen::OutMsgQueueInfo::Record out_msg_queue_info;
+  block::gen::OutMsgQueueExtra::Record out_msg_queue_extra;
+  if (!tlb::unpack_cell(state_root, sstate) || !tlb::unpack_cell(sstate.out_msg_queue_info, out_msg_queue_info)) {
+    fatal_error("cannot unpack shard state");
+    return;
+  }
+  vm::CellSlice& extra_slice = out_msg_queue_info.extra.write();
+  if (extra_slice.fetch_long(1)) {
+    if (!tlb::unpack(extra_slice, out_msg_queue_extra)) {
+      fatal_error("cannot unpack OutMsgQueueExtra");
+      return;
+    }
+    dispatch_queue = std::make_unique<vm::AugmentedDictionary>(out_msg_queue_extra.dispatch_queue, 256,
+                                                               block::tlb::aug_DispatchQueue);
+  } else {
+    dispatch_queue = std::make_unique<vm::AugmentedDictionary>(256, block::tlb::aug_DispatchQueue);
+  }
+
+  int remaining = std::min(max_messages, with_messages_boc ? 16 : 64);
+  bool complete = false;
+  std::vector<tl_object_ptr<lite_api::liteServer_dispatchQueueMessage>> result;
+  std::vector<td::Ref<vm::Cell>> message_roots;
+  td::Bits256 orig_addr = addr;
+  bool first = true;
+  while (remaining > 0) {
+    auto value = dispatch_queue->extract_value(dispatch_queue->lookup_nearest_key(addr, true, first));
+    if (value.is_null() || (one_account && addr != orig_addr)) {
+      complete = true;
+      break;
+    }
+    vm::Dictionary account_queue{64};
+    td::uint64 dict_size;
+    if (!block::unpack_account_dispatch_queue(value, account_queue, dict_size)) {
+      fatal_error(PSTRING() << "invalid account dispatch queue for account " << addr.to_hex());
+      return;
+    }
+    CHECK(dict_size > 0);
+    while (true) {
+      td::BitArray<64> lt_key;
+      lt_key.store_ulong(lt);
+      auto value2 = account_queue.lookup_nearest_key(lt_key, true, false);
+      if (value2.is_null()) {
+        break;
+      }
+      lt = lt_key.to_ulong();
+      if (remaining == 0) {
+        break;
+      }
+      --remaining;
+      auto msg_env = value2->prefetch_ref();
+      block::tlb::MsgEnvelope::Record_std env;
+      if (msg_env.is_null() || !tlb::unpack_cell(msg_env, env)) {
+        fatal_error(PSTRING() << "invalid message in dispatch queue for account " << addr.to_hex() << ", lt " << lt);
+        return;
+      }
+      message_roots.push_back(env.msg);
+      tl_object_ptr<lite_api::liteServer_transactionMetadata> metadata_tl;
+      if (env.metadata) {
+        auto& metadata = env.metadata.value();
+        metadata_tl = create_tl_object<lite_api::liteServer_transactionMetadata>(
+            0, metadata.depth,
+            create_tl_object<lite_api::liteServer_accountId>(metadata.initiator_wc, metadata.initiator_addr),
+            metadata.initiator_lt);
+      } else {
+        metadata_tl = create_tl_object<lite_api::liteServer_transactionMetadata>(
+            0, -1, create_tl_object<lite_api::liteServer_accountId>(workchainInvalid, td::Bits256::zero()), -1);
+      }
+      result.push_back(create_tl_object<lite_api::liteServer_dispatchQueueMessage>(addr, lt, env.msg->get_hash().bits(),
+                                                                                   std::move(metadata_tl)));
+    }
+    first = false;
+    lt = 0;
+  }
+
+  td::BufferSlice proof;
+  if (with_proof) {
+    Ref<vm::Cell> proof1, proof2;
+    if (!make_state_root_proof(proof1)) {
+      return;
+    }
+    if (!pb.extract_proof_to(proof2)) {
+      fatal_error("unknown error creating Merkle proof");
+      return;
+    }
+    auto r_proof = vm::std_boc_serialize_multi({std::move(proof1), std::move(proof2)});
+    if (r_proof.is_error()) {
+      fatal_error(r_proof.move_as_error());
+      return;
+    }
+    proof = r_proof.move_as_ok();
+  }
+  td::BufferSlice messages_boc;
+  if (with_messages_boc) {
+    auto r_messages_boc = vm::std_boc_serialize_multi(std::move(message_roots));
+    if (r_messages_boc.is_error()) {
+      fatal_error(r_messages_boc.move_as_error());
+      return;
+    }
+    messages_boc = r_messages_boc.move_as_ok();
+  }
+  LOG(INFO) << "getDispatchQueueMessages(" << blk_id_.to_str() << ", " << mode_ << ") query completed";
+  auto b = ton::create_serialize_tl_object<ton::lite_api::liteServer_dispatchQueueMessages>(
+      mode_, ton::create_tl_lite_block_id(blk_id_), std::move(result), complete, std::move(proof),
+      std::move(messages_boc));
+  finish_query(std::move(b));
+}
 
 void LiteQuery::perform_nonfinal_getCandidate(td::Bits256 source, BlockIdExt blkid, td::Bits256 collated_data_hash) {
   LOG(INFO) << "started a nonfinal.getCandidate liteserver query";

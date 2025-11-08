@@ -102,7 +102,7 @@ td::Result<td::BufferSlice> DecryptorEd25519::decrypt(td::Slice data) {
   ctr.encrypt(data, res.as_slice());
 
   td::UInt256 real_digest;
-  td::sha256(res.as_slice(), as_slice(real_digest));
+  td::sha256(res.as_slice(), as_mutable_slice(real_digest));
 
   if (as_slice(real_digest) != digest) {
     return td::Status::Error(ErrorCode::protoviolation, "sha256 mismatch after decryption");
@@ -162,7 +162,7 @@ td::Result<td::BufferSlice> DecryptorAES::decrypt(td::Slice data) {
   ctr.encrypt(data, res.as_slice());
 
   td::UInt256 real_digest;
-  td::sha256(res.as_slice(), as_slice(real_digest));
+  td::sha256(res.as_slice(), as_mutable_slice(real_digest));
 
   if (as_slice(real_digest) != digest) {
     return td::Status::Error(ErrorCode::protoviolation, "sha256 mismatch after decryption");

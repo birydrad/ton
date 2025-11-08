@@ -29,6 +29,7 @@ namespace td {
 struct Stat {
   bool is_dir_;
   bool is_reg_;
+  bool is_symbolic_link_;
   int64 size_;
   int64 real_size_;
   uint64 atime_nsec_;
@@ -64,6 +65,12 @@ Status update_atime(CSlice path) TD_WARN_UNUSED_RESULT;
 
 #endif
 
-Result<uint64> get_total_ram() TD_WARN_UNUSED_RESULT;
+struct TotalMemStat {
+  uint64 total_ram;
+  uint64 available_ram;
+};
+Result<TotalMemStat> get_total_mem_stat() TD_WARN_UNUSED_RESULT;
+
+Result<uint32> get_cpu_cores() TD_WARN_UNUSED_RESULT;
 
 }  // namespace td

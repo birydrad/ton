@@ -50,7 +50,7 @@ Ref<DataCell> CellBuilder::finalize_copy(bool special) const {
   if (vm_state_interface) {
     vm_state_interface->register_cell_create();
   }
-  auto res = DataCell::create(data, size(), td::span(refs.data(), size_refs()), special);
+  auto res = DataCell::create(td::Slice{data, Cell::max_bytes}, size(), td::span(refs.data(), size_refs()), special);
   if (res.is_error()) {
     LOG(DEBUG) << res.error();
     throw CellWriteError{};
@@ -68,7 +68,8 @@ Ref<DataCell> CellBuilder::finalize_copy(bool special) const {
 }
 
 td::Result<Ref<DataCell>> CellBuilder::finalize_novm_nothrow(bool special) {
-  auto res = DataCell::create(data, size(), td::mutable_span(refs.data(), size_refs()), special);
+  auto res =
+      DataCell::create(td::Slice{data, Cell::max_bytes}, size(), td::mutable_span(refs.data(), size_refs()), special);
   bits = refs_cnt = 0;
   return res;
 }
@@ -99,7 +100,7 @@ Ref<DataCell> CellBuilder::finalize(bool special) {
 }
 
 Ref<Cell> CellBuilder::create_pruned_branch(Ref<Cell> cell, td::uint32 new_level, td::uint32 virt_level) {
-  if (cell->is_loaded() && cell->get_level() <= virt_level && cell->get_virtualization() == 0) {
+  if (cell->is_loaded() && cell->get_level() <= virt_level && !cell->is_virtualized()) {
     CellSlice cs(NoVm{}, cell);
     if (cs.size_refs() == 0) {
       return cell;
@@ -617,7 +618,7 @@ std::string CellBuilder::to_hex() const {
   int len = serialize(buff, sizeof(buff));
   char hex_buff[Cell::max_serialized_bytes * 2 + 1];
   for (int i = 0; i < len; i++) {
-    sprintf(hex_buff + 2 * i, "%02x", buff[i]);
+    snprintf(hex_buff + 2 * i, sizeof(hex_buff) - 2 * i, "%02x", buff[i]);
   }
   return hex_buff;
 }

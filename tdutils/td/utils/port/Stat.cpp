@@ -28,6 +28,7 @@
 #include "td/utils/port/Clocks.h"
 #include "td/utils/port/detail/skip_eintr.h"
 #include "td/utils/ScopeGuard.h"
+#include "td/utils/StackAllocator.h"
 
 #include <utility>
 
@@ -57,9 +58,11 @@
 #ifndef PSAPI_VERSION
 #define PSAPI_VERSION 1
 #endif
+#ifdef __MINGW32__
 #include <psapi.h>
-#pragma comment( lib, "psapi.lib" )
-
+#else
+#include <Psapi.h>
+#endif
 
 #endif
 
@@ -135,6 +138,7 @@ Stat from_native_stat(const struct ::stat &buf) {
   res.real_size_ = buf.st_blocks * 512;
   res.is_dir_ = (buf.st_mode & S_IFMT) == S_IFDIR;
   res.is_reg_ = (buf.st_mode & S_IFMT) == S_IFREG;
+  res.is_symbolic_link_ = (buf.st_mode & S_IFMT) == S_IFLNK;
   return res;
 }
 
@@ -239,10 +243,13 @@ Result<MemStat> mem_stat() {
     fd.close();
   };
 
-  constexpr int TMEM_SIZE = 10000;
-  char mem[TMEM_SIZE];
+  constexpr size_t TMEM_SIZE = 65536;
+  auto buf = StackAllocator::alloc(TMEM_SIZE);
+  char *mem = buf.as_slice().data();
   TRY_RESULT(size, fd.read(MutableSlice(mem, TMEM_SIZE - 1)));
-  CHECK(size < TMEM_SIZE - 1);
+  if (size >= TMEM_SIZE - 1) {
+    return Status::Error("The file /proc/self/status is too big");
+  }
   mem[size] = 0;
 
   const char *s = mem;
@@ -300,6 +307,8 @@ Result<MemStat> mem_stat() {
     return Status::Error("Call to GetProcessMemoryInfo failed");
   }
 
+  // Working set = all non-virtual memory in RAM, including memory-mapped files
+  // PrivateUsage = Commit charge = all non-virtual memory in RAM and swap file, but not in memory-mapped files
   MemStat res;
   res.resident_size_ = counters.WorkingSetSize;
   res.resident_size_peak_ = counters.PeakWorkingSetSize;
@@ -318,11 +327,12 @@ Status cpu_stat_self(CpuStat &stat) {
     fd.close();
   };
 
-  constexpr int TMEM_SIZE = 10000;
-  char mem[TMEM_SIZE];
+  constexpr size_t TMEM_SIZE = 65536;
+  auto buf = StackAllocator::alloc(TMEM_SIZE);
+  char *mem = buf.as_slice().data();
   TRY_RESULT(size, fd.read(MutableSlice(mem, TMEM_SIZE - 1)));
   if (size >= TMEM_SIZE - 1) {
-    return Status::Error("Failed for read /proc/self/stat");
+    return Status::Error("The file /proc/self/stat is too big");
   }
   mem[size] = 0;
 
@@ -356,11 +366,12 @@ Status cpu_stat_total(CpuStat &stat) {
     fd.close();
   };
 
-  constexpr int TMEM_SIZE = 10000;
-  char mem[TMEM_SIZE];
+  constexpr size_t TMEM_SIZE = 65536;
+  auto buf = StackAllocator::alloc(TMEM_SIZE);
+  char *mem = buf.as_slice().data();
   TRY_RESULT(size, fd.read(MutableSlice(mem, TMEM_SIZE - 1)));
   if (size >= TMEM_SIZE - 1) {
-    return Status::Error("Failed for read /proc/stat");
+    return Status::Error("The file /proc/stat is too big");
   }
   mem[size] = 0;
 
@@ -413,7 +424,7 @@ Result<CpuStat> cpu_stat() {
 #endif
 }
 
-Result<uint64> get_total_ram() {
+Result<TotalMemStat> get_total_mem_stat() {
 #if TD_LINUX
   TRY_RESULT(fd, FileFd::open("/proc/meminfo", FileFd::Read));
   SCOPE_EXIT {
@@ -425,8 +436,10 @@ Result<uint64> get_total_ram() {
   if (size >= TMEM_SIZE - 1) {
     return Status::Error("Failed for read /proc/meminfo");
   }
+  TotalMemStat stat;
   mem[size] = 0;
-  const char* s = mem;
+  const char *s = mem;
+  size_t got = 0;
   while (*s) {
     const char *name_begin = s;
     while (*s != 0 && *s != '\n') {
@@ -437,18 +450,28 @@ Result<uint64> get_total_ram() {
       name_end++;
     }
     Slice name(name_begin, name_end);
+    td::uint64 *dest = nullptr;
     if (name == "MemTotal") {
+      dest = &stat.total_ram;
+    } else if (name == "MemAvailable") {
+      dest = &stat.available_ram;
+    }
+    if (dest != nullptr) {
       Slice value(name_end, s);
       if (!value.empty() && value[0] == ':') {
         value.remove_prefix(1);
       }
       value = trim(value);
       value = split(value).first;
-      TRY_RESULT_PREFIX(mem, to_integer_safe<uint64>(value), "Invalid value of MemTotal");
+      TRY_RESULT_PREFIX(mem, to_integer_safe<uint64>(value), PSLICE() << "Invalid value of " << name);
       if (mem >= 1ULL << (64 - 10)) {
         return Status::Error("Invalid value of MemTotal");
       }
-      return mem * 1024;
+      *dest = mem * 1024;
+      got++;
+      if (got == 2) {
+        return stat;
+      }
     }
     if (*s == 0) {
       break;
@@ -456,6 +479,47 @@ Result<uint64> get_total_ram() {
     s++;
   }
   return Status::Error("No MemTotal in /proc/meminfo");
+#else
+  return Status::Error("Not supported");
+#endif
+}
+
+Result<uint32> get_cpu_cores() {
+#if TD_LINUX
+  uint32 result = 0;
+  TRY_RESULT(fd, FileFd::open("/proc/cpuinfo", FileFd::Read));
+  SCOPE_EXIT {
+    fd.close();
+  };
+  std::string data;
+  char buf[10000];
+  while (true) {
+    TRY_RESULT(size, fd.read(MutableSlice{buf, sizeof(buf) - 1}));
+    if (size == 0) {
+      break;
+    }
+    buf[size] = '\0';
+    data += buf;
+  }
+  size_t i = 0;
+  while (i < data.size()) {
+    const char *line_begin = data.data() + i;
+    while (i < data.size() && data[i] != '\n') {
+      ++i;
+    }
+    auto line_end = data.data() + i;
+    ++i;
+    Slice line{line_begin, line_end};
+    size_t j = 0;
+    while (j < line.size() && line[j] != ' ' && line[j] != '\t' && line[j] != ':') {
+      ++j;
+    }
+    Slice name = line.substr(0, j);
+    if (name == "processor") {
+      ++result;
+    }
+  }
+  return result;
 #else
   return Status::Error("Not supported");
 #endif

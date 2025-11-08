@@ -1,6 +1,6 @@
 name: Tonlib Android
 
-on: [push,workflow_dispatch,workflow_call]
+on: [push, pull_request, workflow_dispatch, workflow_call]
 
 jobs:
   build:
@@ -9,7 +9,7 @@ jobs:
     steps:
     - name: Check out repository
       uses: actions/checkout@v3
-      with:      
+      with:
         submodules: 'recursive'
 
     - name: Install system libraries
@@ -19,8 +19,17 @@ jobs:
         zlib1g-dev libssl-dev libreadline-dev libmicrohttpd-dev pkg-config libgsl-dev python3 python3-dev \
         libtool autoconf libsodium-dev libsecp256k1-dev liblz4-dev
 
+    - name: Cache Android NDK
+      id: cache-android-ndk
+      uses: actions/cache@v4
+      with:
+        path: android-ndk-r25b
+        key: ${{ runner.os }}-${{ runner.arch }}-ubuntu-22.04-cache-android-ndk-${{ hashFiles('**/assembly/android/build-android-tonlib.sh') }}
+
     - name: Build TON
       run: |
+        git submodule sync --recursive
+        git submodule update
         cp assembly/android/build-android-tonlib.sh .
         chmod +x build-android-tonlib.sh
         ./build-android-tonlib.sh -a
@@ -28,5 +37,5 @@ jobs:
     - name: Upload artifacts
       uses: actions/upload-artifact@master
       with:
-        name: tonlib-android
+        name: ton-android-tonlib
         path: artifacts
