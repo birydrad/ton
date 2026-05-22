@@ -309,17 +309,25 @@ void DhtQueryStore::send_stores(td::Result<DhtNodesList> R) {
     return;
   }
   auto list = R.move_as_ok();
+  bool stored_locally = false;
   if (list.size() < k_) {
     td::actor::send_closure(node_, &DhtMember::store_in, value_.clone());
+    stored_locally = true;
   } else {
     auto last_key = list.list().rbegin()->get_key();
     auto value_key = value_.key_id();
     if ((value_key ^ src_) < (value_key ^ last_key)) {
       td::actor::send_closure(node_, &DhtMember::store_in, value_.clone());
+      stored_locally = true;
     }
   }
 
   remaining_ = static_cast<td::uint32>(list.size());
+  if (remaining_ == 0) {
+    promise_.set_result(stored_locally ? td::Status::OK() : td::Status::Error("no nodes to store to"));
+    stop();
+    return;
+  }
 
   for (auto &node : list.list()) {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {

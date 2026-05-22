@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "td/utils/ThreadSafeCounter.h"
 
 #include "ActorStats.h"
@@ -89,22 +91,20 @@ std::string ActorStats::prepare_stats() {
   td::StringBuilder sb;
   sb << "================================= PERF COUNTERS ================================\n";
   sb << "ticks_per_second_estimate\t" << 1.0 / estimated_inv_ticks_per_second << "\n";
-  for (auto &it : perf_map_10s) {
-    const std::string &name = it.first;
-    auto dot_at = name.rfind('.');
-    CHECK(dot_at != std::string::npos);
-    auto base_name = name.substr(0, dot_at);
-    auto rest_name = name.substr(dot_at + 1);
-    td::Slice new_rest_name = rest_name;
-    if (rest_name == "count") {
-      new_rest_name = "qps";
+  // Sort base counters by 10s load descending; print .count and .duration of each base together.
+  std::vector<std::pair<double, std::string>> bases;  // (-load_10s, base)
+  for (auto &[name, value] : perf_map_10s) {
+    if (td::ends_with(name, ".duration")) {
+      bases.emplace_back(-value, name.substr(0, name.size() - 9));
     }
-    if (rest_name == "duration") {
-      new_rest_name = "load";
+  }
+  std::sort(bases.begin(), bases.end());
+  for (auto &[_, base] : bases) {
+    for (auto suffix : {std::pair{".count", "qps"}, std::pair{".duration", "load"}}) {
+      auto name = base + suffix.first;
+      sb << base << "." << suffix.second << "\t" << perf_map_10s[name] << " " << perf_map_10m[name] << " "
+         << current_perf_map[name] << "\n";
     }
-    auto rewrite_name = PSTRING() << base_name << "." << new_rest_name;
-    sb << rewrite_name << "\t" << perf_map_10s[name] << " " << perf_map_10m[name] << " " << current_perf_map[name]
-       << "\n";
   }
   sb << "\n";
   sb << "================================= ACTORS STATS =================================\n";

@@ -21,6 +21,7 @@
 #include "auto/tl/ton_api.hpp"
 #include "keys/encryptor.h"
 #include "td/utils/Random.h"
+#include "td/utils/ThreadSafeCounter.h"
 #include "td/utils/overloaded.h"
 
 #include "dht-types.h"
@@ -86,6 +87,7 @@ td::Status DhtKeyDescription::check() const {
 
   auto B = serialize_tl_object(obj, true);
   TRY_RESULT(E, public_key_.create_encryptor());
+  TD_PERF_COUNTER(check_signature_dht_key_description);
   TRY_STATUS(E->check_signature(B.as_slice(), signature_.as_slice()));
   return td::Status::OK();
 }
@@ -137,6 +139,7 @@ td::Result<DhtKeyDescription> DhtKeyDescription::create(tl_object_ptr<ton_api::d
 
   if (check_signature) {
     TRY_RESULT(E, public_key.create_encryptor());
+    TD_PERF_COUNTER(check_signature_dht_key_description_create);
     TRY_STATUS(E->check_signature(to_sign.as_slice(), signature.as_slice()));
   }
 
@@ -231,6 +234,7 @@ td::Status DhtUpdateRuleSignature::check_value(const DhtValue &value) {
   auto tl = value.tl();
   auto sig = std::move(tl->signature_);
   auto B = serialize_tl_object(tl, true);
+  TD_PERF_COUNTER(check_signature_dht_value);
   return E->check_signature(B.as_slice(), sig.as_slice());
 }
 
@@ -304,6 +308,7 @@ td::Status DhtUpdateRuleOverlayNodes::check_value(const DhtValue &value) {
     }
     auto B = serialize_tl_object(obj, true);
     TRY_RESULT(E, pub.pubkey().create_encryptor());
+    TD_PERF_COUNTER(check_signature_dht_overlay_nodes_entry);
     TRY_STATUS(E->check_signature(B.as_slice(), sig.as_slice()));
   }
   return td::Status::OK();

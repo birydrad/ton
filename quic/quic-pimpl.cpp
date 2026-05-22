@@ -4,6 +4,7 @@
 #include <openssl/ssl.h>
 
 #include "td/utils/Random.h"
+#include "td/utils/ThreadSafeCounter.h"
 #include "td/utils/Timer.h"
 #include "td/utils/logging.h"
 
@@ -490,6 +491,7 @@ td::Status QuicConnectionPImpl::produce_egress(UdpMessageBuffer& msg_out, bool u
 }
 
 td::Status QuicConnectionPImpl::handle_ingress(const UdpMessageBuffer& msg_in) {
+  TD_PERF_COUNTER(quic_handle_ingress);
   ngtcp2_path path = make_path(msg_in.address);
   ngtcp2_pkt_info pi{};
   int rv = ngtcp2_conn_read_pkt(conn(), &path, &pi, reinterpret_cast<uint8_t*>(msg_in.storage.data()),

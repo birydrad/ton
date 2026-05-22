@@ -17,6 +17,7 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #include "keys/encryptor.h"
+#include "td/utils/ThreadSafeCounter.h"
 
 #include "dht-node.hpp"
 
@@ -59,6 +60,7 @@ td::Status DhtNode::update(tl_object_ptr<ton_api::dht_node> obj, td::int32 our_n
 }
 
 td::Status DhtNode::check_signature() const {
+  TD_PERF_COUNTER(check_signature_dht_node);
   TRY_RESULT(enc, id_.pubkey().create_encryptor());
   auto node2 = clone();
   node2.signature_ = {};

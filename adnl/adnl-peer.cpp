@@ -19,6 +19,7 @@
 #include "auto/tl/ton_api.h"
 #include "td/actor/PromiseFuture.h"
 #include "td/utils/Random.h"
+#include "td/utils/ThreadSafeCounter.h"
 #include "td/utils/base64.h"
 #include "td/utils/overloaded.h"
 
@@ -262,7 +263,11 @@ void AdnlPeerPairImpl::receive_packet(AdnlPacket packet, td::uint64 serialized_s
     return;
   }
 
-  auto S = encryptor_->check_signature(packet.to_sign().as_slice(), packet.signature().as_slice());
+  td::Status S;
+  {
+    TD_PERF_COUNTER(check_signature_adnl_packet);
+    S = encryptor_->check_signature(packet.to_sign().as_slice(), packet.signature().as_slice());
+  }
   if (S.is_error()) {
     VLOG(ADNL_NOTICE) << this << "dropping IN message: bad signature: " << S;
     return;

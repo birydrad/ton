@@ -1,7 +1,8 @@
 #include <atomic>
-#include <chrono>
 
 #include "td/actor/actor.h"
+#include "td/utils/ThreadSafeCounter.h"
+#include "td/utils/Time.h"
 #include "td/utils/Timer.h"
 
 #include "quic-pimpl.h"
@@ -14,9 +15,7 @@ namespace {
 constexpr ngtcp2_duration RETRY_TOKEN_TIMEOUT = 10 * NGTCP2_SECONDS;
 
 ngtcp2_tstamp retry_token_now() {
-  return static_cast<ngtcp2_tstamp>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-          .count());
+  return static_cast<ngtcp2_tstamp>(td::Time::system_now() * 1e9);
 }
 
 }  // namespace
@@ -637,6 +636,7 @@ td::Result<QuicConnectionId> QuicServer::connect(td::Slice host, int port, td::E
 }
 
 void QuicServer::drain_ingress() {
+  TD_PERF_COUNTER(quic_drain_ingress);
   td::PerfWarningTimer w("drain_ingress", 0.1);
   const size_t buf_size = gro_enabled_ ? kMaxDatagram : DEFAULT_MTU * kMaxBurst;
 
@@ -818,6 +818,7 @@ bool QuicServer::produce_next_egress(size_t batch_index) {
 }
 
 void QuicServer::flush_egress() {
+  TD_PERF_COUNTER(quic_flush_egress);
   td::PerfWarningTimer w("flush_egress_all", 0.1);
 
   // First flush any pending from previous call

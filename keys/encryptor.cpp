@@ -16,9 +16,14 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <mutex>
+#include <queue>
+#include <set>
+
 #include "auto/tl/ton_api.hpp"
 #include "common/errorcode.h"
 #include "common/status.h"
+#include "td/utils/ThreadSafeCounter.h"
 #include "td/utils/crypto.h"
 #include "td/utils/overloaded.h"
 
@@ -27,6 +32,44 @@
 #include "keys.hpp"
 
 namespace ton {
+
+namespace {
+
+// Test-friendly LRU cache of successfully-verified Ed25519 signatures.
+// Key: sha256(pubkey || message || signature). Pure function, so caching
+// across nodes is safe — verification result depends only on the tuple.
+class VerifiedSignatureCache {
+ public:
+  static constexpr size_t kCapacity = 16384;
+
+  bool contains(const td::Bits256& key) {
+    std::lock_guard lock(mutex_);
+    return set_.count(key) != 0;
+  }
+  void insert(const td::Bits256& key) {
+    std::lock_guard lock(mutex_);
+    if (!set_.insert(key).second) {
+      return;
+    }
+    fifo_.push(key);
+    if (fifo_.size() > kCapacity) {
+      set_.erase(fifo_.front());
+      fifo_.pop();
+    }
+  }
+
+  static VerifiedSignatureCache& instance() {
+    static VerifiedSignatureCache cache;
+    return cache;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::set<td::Bits256> set_;
+  std::queue<td::Bits256> fifo_;
+};
+
+}  // namespace
 
 td::Result<td::BufferSlice> EncryptorEd25519::encrypt(td::Slice data) {
   TRY_RESULT_PREFIX(pk, td::Ed25519::generate_private_key(), "failed to generate private key: ");
@@ -68,7 +111,28 @@ td::Result<td::BufferSlice> EncryptorEd25519::encrypt(td::Slice data) {
 }
 
 td::Status EncryptorEd25519::check_signature(td::Slice message, td::Slice signature) {
-  return td::status_prefix(pub_.verify_signature(message, signature), "bad signature: ");
+  TD_PERF_COUNTER(EncryptorEd25519_check_signature);
+
+  td::Bits256 cache_key;
+  {
+    auto pubkey = pub_.as_octet_string();
+    td::Sha256State hasher;
+    hasher.init();
+    hasher.feed(pubkey);
+    hasher.feed(message);
+    hasher.feed(signature);
+    hasher.extract(cache_key.as_slice());
+  }
+  auto& cache = VerifiedSignatureCache::instance();
+  if (cache.contains(cache_key)) {
+    TD_PERF_COUNTER(EncryptorEd25519_check_signature_cached);
+    return td::Status::OK();
+  }
+  auto status = td::status_prefix(pub_.verify_signature(message, signature), "bad signature: ");
+  if (status.is_ok()) {
+    cache.insert(cache_key);
+  }
+  return status;
 }
 
 td::Result<td::BufferSlice> DecryptorEd25519::decrypt(td::Slice data) {
