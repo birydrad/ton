@@ -396,6 +396,7 @@ void FullNodeFastSyncOverlay::init() {
   options.broadcast_speed_multiplier_ = broadcast_speed_multiplier_;
   options.twostep_broadcast_sender_ = adnl_sender_;
   options.send_twostep_broadcast_ = send_twostep_broadcasts_;
+  options.experimental_broadcast_sender_ = adnl_sender_;
   td::actor::send_closure(overlays_, &overlay::Overlays::create_semiprivate_overlay, local_id_,
                           overlay_id_full_.clone(), current_validators_adnl_, root_public_keys_, member_certificate_,
                           std::make_unique<Callback>(actor_id(this)), rules, std::move(scope), options);

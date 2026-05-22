@@ -37,6 +37,7 @@
 #include "dht/dht.hpp"
 #include "keys/keys.hpp"
 #include "memprof/memprof.h"
+#include "overlay/broadcast/overlay-broadcast.h"
 #include "td/actor/MultiPromise.h"
 #include "td/actor/PromiseFuture.h"
 #include "td/actor/actor.h"
@@ -6109,6 +6110,21 @@ int main(int argc, char *argv[]) {
             [&x, v]() { td::actor::send_closure(x, &ValidatorEngine::set_broadcast_speed_multiplier_fast_sync, v); });
         return td::Status::OK();
       });
+  auto add_experimental_broadcast_option = [&](const char *name, const char *description,
+                                               ton::overlay::ExperimentalBroadcastOverlay overlay) {
+    p.add_checked_option('\0', td::Slice{name}, td::Slice{description}, [overlay](td::Slice s) -> td::Status {
+      auto algorithm = s.str();
+      TRY_STATUS(ton::overlay::check_overlay_broadcast_algorithm_name(algorithm));
+      ton::overlay::set_experimental_broadcast_algorithm(overlay, std::move(algorithm));
+      return td::Status::OK();
+    });
+  };
+  add_experimental_broadcast_option("experimental-public-broadcast", "force public shard overlay broadcast algorithm",
+                                    ton::overlay::ExperimentalBroadcastOverlay::Public);
+  add_experimental_broadcast_option("experimental-fast-sync-broadcast", "force fast-sync overlay broadcast algorithm",
+                                    ton::overlay::ExperimentalBroadcastOverlay::FastSync);
+  add_experimental_broadcast_option("experimental-private-broadcast", "force private overlay broadcast algorithm",
+                                    ton::overlay::ExperimentalBroadcastOverlay::Private);
   p.add_option(
       '\0', "permanent-celldb",
       "disable garbage collection in CellDb. This improves performance on archival nodes (once enabled, this option "

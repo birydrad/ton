@@ -276,6 +276,20 @@ overlay.broadcastTwostep.id flags:int date:int src:int256 src_adnl_id:int256 dat
 overlay.broadcastTwostepSimple.toSign id:int256 data:bytes = overlay.broadcastTwostepSimple.ToSign;
 overlay.broadcastTwostepFec.toSign id:int256 seqno:int part:bytes = overlay.broadcastTwostepFec.ToSign;
 
+overlay.broadcastV2.modeEagerLazy = overlay.broadcastV2.Mode;
+overlay.broadcastV2.modePlumtree = overlay.broadcastV2.Mode;
+overlay.broadcastV2.modeOptimumP2P required_pieces:int = overlay.broadcastV2.Mode;
+overlay.broadcastV2.modeTwostepSimple = overlay.broadcastV2.Mode;
+overlay.broadcastV2.modeTwostepFec required_pieces:int = overlay.broadcastV2.Mode;
+overlay.broadcastV2.id flags:int date:int src:int256 src_adnl_id:int256 data_hash:int256 data_size:int extra:bytes mode:overlay.broadcastV2.Mode = overlay.broadcastV2.Id;
+overlay.broadcastV2.source src:PublicKey certificate:overlay.Certificate signature:bytes = overlay.broadcastV2.Source;
+overlay.broadcastV2Piece id:overlay.broadcastV2.Id source:overlay.broadcastV2.Source seqno:int data:bytes = overlay.Broadcast;
+overlay.broadcastV2Have id:overlay.broadcastV2.Id source:overlay.broadcastV2.Source = overlay.Broadcast;
+overlay.broadcastV2Request id:overlay.broadcastV2.Id source:overlay.broadcastV2.Source = overlay.Broadcast;
+overlay.broadcastV2Cancel id:overlay.broadcastV2.Id source:overlay.broadcastV2.Source = overlay.Broadcast;
+overlay.broadcastV2.toSignBroadcast id:int256 = overlay.broadcastV2.ToSign;
+overlay.broadcastV2.toSignPiece id:int256 seqno:int data:bytes = overlay.broadcastV2.ToSign;
+
 ---functions---
 
 overlay.getRandomPeers peers:overlay.nodes = overlay.Nodes;

@@ -49,6 +49,8 @@ void OverlayImpl::del_peer(const adnl::AdnlNodeIdShort &id) {
   }
   peer_list_.peers_.remove(id);
   peer_list_.bad_peers_.erase(id);
+  touch_peer_mtu(id);
+  broadcasts_v2_.on_overlay_peer_removed(id);
 }
 
 void OverlayImpl::del_from_neighbour_list(OverlayPeer *P) {
@@ -69,6 +71,7 @@ void OverlayImpl::del_from_neighbour_list(OverlayPeer *P) {
   }
   CHECK(deleted);
   P->set_neighbour(false);
+  touch_peer_mtu(id);
 }
 
 void OverlayImpl::del_from_neighbour_list(const adnl::AdnlNodeIdShort &id) {
@@ -225,6 +228,7 @@ void OverlayImpl::add_peer(OverlayNode node, bool verified, bool checked_signatu
   if (V) {
     VLOG(OVERLAY_DEBUG) << this << ": updating peer " << id << " up to version " << node.version();
     V->update(std::move(node));
+    touch_peer_mtu(id);
   } else if (verified) {
     VLOG(OVERLAY_DEBUG) << this << ": adding peer " << id << " of version " << node.version();
     CHECK(overlay_type_ != OverlayType::CertificatedMembers || (node.certificate() && !node.certificate()->empty()));
@@ -236,9 +240,12 @@ void OverlayImpl::add_peer(OverlayNode node, bool verified, bool checked_signatu
         !(X->get_node()->flags() & OverlayMemberFlags::DoNotReceiveBroadcasts) && X->get_id() != local_id_) {
       peer_list_.neighbours_.push_back(X->get_id());
       X->set_neighbour(true);
+      touch_peer_mtu(X->get_id());
     }
 
     update_neighbours(0);
+    touch_peer_mtu(id);
+    broadcasts_v2_.on_overlay_peer_added(this, id);
   } else if (!processing_pending_peers_.contains(id)) {
     VLOG(OVERLAY_DEBUG) << this << ": adding pending peer " << id << " of version " << node.version();
     auto pending = peer_list_.pending_peers_.get(id);
@@ -538,6 +545,7 @@ void OverlayImpl::update_neighbours(td::uint32 nodes_to_change, bool allow_delet
       VLOG(OVERLAY_INFO) << this << ": adding new neighbour " << X->get_id();
       peer_list_.neighbours_.push_back(X->get_id());
       X->set_neighbour(true);
+      touch_peer_mtu(X->get_id());
     } else {
       CHECK(nodes_to_change > 0);
       auto i = td::Random::fast(0, static_cast<td::uint32>(peer_list_.neighbours_.size()) - 1);
@@ -545,9 +553,11 @@ void OverlayImpl::update_neighbours(td::uint32 nodes_to_change, bool allow_delet
       CHECK(Y != nullptr);
       CHECK(Y->is_neighbour());
       Y->set_neighbour(false);
+      touch_peer_mtu(Y->get_id());
       peer_list_.neighbours_[i] = X->get_id();
       X->set_neighbour(true);
       nodes_to_change--;
+      touch_peer_mtu(X->get_id());
       VLOG(OVERLAY_INFO) << this << ": changing neighbour " << Y->get_id() << " -> " << X->get_id();
     }
   }
@@ -674,7 +684,20 @@ void OverlayImpl::update_peer_err_ctr(adnl::AdnlNodeIdShort peer_id, bool is_fec
     } else {
       src_peer->broadcast_errors++;
     }
+    src_peer->broadcast_score.add(1.0, td::Time::now());
   }
+}
+
+void OverlayImpl::update_peer_broadcast_score(adnl::AdnlNodeIdShort peer_id, double score_delta) {
+  auto peer = peer_list_.peers_.get(peer_id);
+  if (peer) {
+    peer->broadcast_score.add(score_delta, td::Time::now());
+  }
+}
+
+double OverlayImpl::peer_broadcast_score(adnl::AdnlNodeIdShort peer_id) {
+  auto peer = peer_list_.peers_.get(peer_id);
+  return peer ? peer->broadcast_score.value_at(td::Time::now()) : 0.0;
 }
 
 void OverlayImpl::update_throughput_out_ctr(adnl::AdnlNodeIdShort peer_id, td::uint64 msg_size, bool is_query,
@@ -800,6 +823,7 @@ void OverlayImpl::update_root_member_list(std::vector<adnl::AdnlNodeIdShort> ids
 
   update_member_certificate(std::move(cert));
   update_neighbours(0);
+  update_peers_mtu();
   cleanup_authorized_key_limiters();
 }
 

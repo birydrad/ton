@@ -690,6 +690,8 @@ target_link_libraries(test-quic-sender adnl dht tl_api quic)
 
 add_executable(test-overlay test/test-overlay.cpp)
 target_link_libraries(test-overlay overlay tdutils tdactor adnl adnltest tl_api dht )
+add_executable(test-overlay-leech test/test-overlay-leech.cpp)
+target_link_libraries(test-overlay-leech overlay tdutils tdactor adnl adnltest tl_api dht quic )
 add_executable(test-ton-collator test/test-ton-collator.cpp)
 target_link_libraries(test-ton-collator overlay tdutils tdactor adnl tl_api dht
   validatorsession validator-disk ton_validator validator-disk )

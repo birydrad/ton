@@ -22,6 +22,11 @@
 #include "adnl/utils.hpp"
 #include "auto/tl/ton_api.h"
 #include "auto/tl/ton_api.hpp"
+#include "broadcast/algorithms/eager-lazy.h"
+#include "broadcast/algorithms/optimum-p2p.h"
+#include "broadcast/algorithms/plumtree.h"
+#include "broadcast/algorithms/twostep.h"
+#include "broadcast/overlay-broadcast-session.h"
 #include "common/delay.h"
 #include "dht/dht.h"
 #include "keys/encryptor.h"
@@ -42,6 +47,81 @@ static std::string overlay_actor_name(const OverlayIdFull &overlay_id, const Ove
     return PSTRING() << "overlay." << overlay_id.compute_short_id().bits256_value().to_hex().substr(0, 4);
   }
   return PSTRING() << "overlay." << opts.name_;
+}
+
+static std::optional<std::string> experimental_public_broadcast_algorithm;
+static std::optional<std::string> experimental_fast_sync_broadcast_algorithm;
+static std::optional<std::string> experimental_private_broadcast_algorithm;
+
+static std::optional<std::string> &experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay) {
+  switch (overlay) {
+    case ExperimentalBroadcastOverlay::Public:
+      return experimental_public_broadcast_algorithm;
+    case ExperimentalBroadcastOverlay::FastSync:
+      return experimental_fast_sync_broadcast_algorithm;
+    case ExperimentalBroadcastOverlay::Private:
+      return experimental_private_broadcast_algorithm;
+  }
+  UNREACHABLE();
+}
+
+static td::StringBuilder &operator<<(td::StringBuilder &sb, ExperimentalBroadcastOverlay overlay) {
+  switch (overlay) {
+    case ExperimentalBroadcastOverlay::Public:
+      return sb << "public";
+    case ExperimentalBroadcastOverlay::FastSync:
+      return sb << "fast-sync";
+    case ExperimentalBroadcastOverlay::Private:
+      return sb << "private";
+  }
+  UNREACHABLE();
+}
+
+static ExperimentalBroadcastOverlay experimental_broadcast_overlay_for(OverlayType overlay_type,
+                                                                       const OverlayOptions &opts) {
+  if (overlay_type == OverlayType::Public) {
+    return ExperimentalBroadcastOverlay::Public;
+  }
+  if (opts.name_.rfind("fast-sync", 0) == 0) {
+    return ExperimentalBroadcastOverlay::FastSync;
+  }
+  return ExperimentalBroadcastOverlay::Private;
+}
+
+std::optional<std::string> get_experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay) {
+  return experimental_broadcast_algorithm(overlay);
+}
+
+void set_experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay, std::string algorithm) {
+  CHECK(!algorithm.empty());
+  auto status = check_overlay_broadcast_algorithm_name(algorithm);
+  if (status.is_error()) {
+    LOG(ERROR) << "ignoring invalid experimental broadcast algorithm: " << status;
+    return;
+  }
+  experimental_broadcast_algorithm(overlay) = std::move(algorithm);
+}
+
+void clear_experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay) {
+  experimental_broadcast_algorithm(overlay).reset();
+}
+
+void log_process_broadcast_status(td::Status status) {
+  LOG_IF(WARNING, status.is_error() && status.code() != ErrorCode::notready)
+      << "Failed to process broadcast: " << status;
+}
+
+void handle_process_broadcast_result(td::Status status) {
+  log_process_broadcast_status(std::move(status));
+}
+
+void handle_process_broadcast_result(td::actor::Task<> task) {
+  [](td::actor::Task<> task) -> td::actor::Task<> {
+    log_process_broadcast_status((co_await std::move(task).wrap()).move_as_status());
+    co_return {};
+  }(std::move(task))
+                                    .start()
+                                    .detach();
 }
 
 td::actor::ActorOwn<Overlay> Overlay::create_public(td::actor::ActorId<keyring::Keyring> keyring,
@@ -105,6 +185,15 @@ OverlayImpl::OverlayImpl(td::actor::ActorId<keyring::Keyring> keyring, td::actor
   frequent_dht_lookup_ = opts_.frequent_dht_lookup_;
   peer_list_.local_member_flags_ = opts_.local_overlay_member_flags_;
   opts_.broadcast_speed_multiplier_ = std::max(opts_.broadcast_speed_multiplier_, 1e-9);
+  auto experimental_overlay = experimental_broadcast_overlay_for(overlay_type_, opts_);
+  experimental_broadcast_algorithm_ = get_experimental_broadcast_algorithm(experimental_overlay);
+  if (experimental_broadcast_algorithm_) {
+    CHECK(!experimental_broadcast_algorithm_->empty());
+    check_overlay_broadcast_algorithm_name(*experimental_broadcast_algorithm_).ensure();
+    LOG_CHECK(!opts_.experimental_broadcast_sender_.empty()) << "Experimental broadcast sender is not set";
+    VLOG(OVERLAY_WARNING) << "experimental broadcast algorithm category=" << experimental_overlay
+                          << " overlay=" << opts_.name_ << " algorithm=" << *experimental_broadcast_algorithm_;
+  }
 
   VLOG(OVERLAY_INFO) << this << ": creating";
 
@@ -125,11 +214,34 @@ OverlayImpl::OverlayImpl(td::actor::ActorId<keyring::Keyring> keyring, td::actor
   if (!opts_.twostep_broadcast_sender_.empty()) {
     broadcasts_twostep_.init_sender(opts_.twostep_broadcast_sender_);
   }
+  broadcasts_v2_.configure(opts_.broadcast_options_);
 
+  // Register algorithm families. Algorithm-side factories build the family with its key/shared/
+  // make_algorithm; bind_* stamps the mode-derived transport (wire+storage+session) on top.
+  std::vector<broadcast::AlgorithmFamily> families;
+  families.push_back(bind_twostep_push(broadcast::make_twostep_push_family()));
+  families.push_back(bind_twostep_fec(broadcast::make_twostep_fec_family()));
+  // Eager-lazy + plumtree push-pull config derived from the overlay's active/lazy limits.
+  broadcast::EagerLazyConfig eager_cfg{
+      .active_peer_limit = opts_.broadcast_options_.active_peer_limit,
+      .lazy_peer_limit = opts_.broadcast_options_.lazy_peer_limit,
+  };
+  families.push_back(bind_push_pull_whole(broadcast::make_eager_lazy_family(eager_cfg), opts_.broadcast_options_));
+  // Plumtree (iroh-gossip style): persistent eager/lazy mesh per overlay; defaults are fine —
+  // the engine fans neighbour churn through PlumtreeShared which seeds eager from `neighbour=true`.
+  families.push_back(bind_push_pull_whole(broadcast::make_plumtree_family({}), opts_.broadcast_options_));
+  // Optimum-P2P picks required_pieces per-broadcast from mode::OptimumP2P; the family closure
+  // reads it from BroadcastInit::required_pieces and patches the base config at make_algorithm.
+  broadcast::OptimumP2PConfig optimum_cfg{
+      .forward_threshold = 1,
+      .piece_peer_limit = 1,
+      .metadata_peer_limit = opts_.broadcast_options_.known_peer_limit,
+      .piece_request_peer_limit = std::max<td::uint32>(
+          1, std::min(opts_.broadcast_options_.active_peer_limit, opts_.broadcast_options_.lazy_peer_limit)),
+  };
+  families.push_back(bind_push_pull_rlnc(broadcast::make_optimum_p2p_family(optimum_cfg), opts_.broadcast_options_));
+  broadcasts_v2_.configure_algorithms(std::move(families));
   receive_peers_rate_limiter_ = td::RateLimiterWindow{10.0, 10 * opts_.nodes_to_send_ * 2 * 10};
-  unauthorized_broadcasts_limiter_.broadcast_rate_limiter_ = td::RateLimiterWindow{opts_.unauth_broadcast_rate_limit_};
-  unauthorized_broadcasts_limiter_.broadcast_size_rate_limiter_ =
-      td::RateLimiterWindow{opts_.unauth_broadcast_size_rate_limit_};
 }
 
 void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getRandomPeers &query,
@@ -137,7 +249,7 @@ void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getR
   if (overlay_type_ != OverlayType::FixedMemberList) {
     VLOG(OVERLAY_DEBUG) << this << ": received " << query.peers_->nodes_.size() << " nodes from " << src
                         << " in getRandomPeers query";
-    add_peers(query.peers_, /* verified = */ false);
+    add_peers(query.peers_, true);
     send_random_peers(src, std::move(promise));
   } else {
     VLOG(OVERLAY_WARNING) << this << ": DROPPING getRandomPeers query from " << src << " in private overlay";
@@ -150,7 +262,7 @@ void OverlayImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::overlay_getR
   if (overlay_type_ != OverlayType::FixedMemberList) {
     VLOG(OVERLAY_DEBUG) << this << ": received " << query.peers_->nodes_.size() << " nodes from " << src
                         << " in getRandomPeers query";
-    add_peers(query.peers_, /* verified = */ false);
+    add_peers(query.peers_, true);
     send_random_peers_v2(src, std::move(promise));
   } else {
     VLOG(OVERLAY_WARNING) << this << ": DROPPING getRandomPeers query from " << src << " in private overlay";
@@ -238,27 +350,27 @@ td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_f
   co_return {};
 }
 
-td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                                 tl_object_ptr<ton_api::overlay_broadcastNotFound> bcast) {
-  co_return td::Status::Error(ErrorCode::protoviolation,
-                              PSTRING() << "received strange message broadcastNotFound from " << message_from);
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_broadcastNotFound> bcast) {
+  return td::Status::Error(ErrorCode::protoviolation,
+                           PSTRING() << "received strange message broadcastNotFound from " << message_from);
 }
 
-td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                                 tl_object_ptr<ton_api::overlay_fec_received> msg) {
-  co_return {};
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_fec_received> msg) {
+  return td::Status::OK();
 }
 
-td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                                 tl_object_ptr<ton_api::overlay_fec_completed> msg) {
-  co_return {};
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_fec_completed> msg) {
+  return td::Status::OK();
 }
 
-td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
-                                                 tl_object_ptr<ton_api::overlay_unicast> msg) {
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_unicast> msg) {
   VLOG(OVERLAY_DEBUG) << this << ": received unicast from " << message_from;
   callback_->receive_message(message_from, overlay_id_, std::move(msg->data_));
-  co_return {};
+  return td::Status::OK();
 }
 
 td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
@@ -279,6 +391,26 @@ td::actor::Task<> OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_f
   co_return {};
 }
 
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_broadcastV2Piece> bcast) {
+  return broadcasts_v2_.process_broadcast(this, message_from, std::move(bcast));
+}
+
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_broadcastV2Have> bcast) {
+  return broadcasts_v2_.process_broadcast(this, message_from, std::move(bcast));
+}
+
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_broadcastV2Request> bcast) {
+  return broadcasts_v2_.process_broadcast(this, message_from, std::move(bcast));
+}
+
+td::Status OverlayImpl::process_broadcast(adnl::AdnlNodeIdShort message_from,
+                                          tl_object_ptr<ton_api::overlay_broadcastV2Cancel> bcast) {
+  return broadcasts_v2_.process_broadcast(this, message_from, std::move(bcast));
+}
+
 void OverlayImpl::receive_message(adnl::AdnlNodeIdShort src, tl_object_ptr<ton_api::overlay_messageExtra> extra,
                                   td::BufferSlice data) {
   if (!check_src_peer(src, extra ? extra->certificate_.get() : nullptr)) {
@@ -294,15 +426,8 @@ void OverlayImpl::receive_message(adnl::AdnlNodeIdShort src, tl_object_ptr<ton_a
   }
   auto Q = X.move_as_ok();
   ton_api::downcast_call(*Q, [self = this, &Q, &src](auto &object) {
-    [](OverlayImpl *self, adnl::AdnlNodeIdShort src, auto obj) -> td::actor::Task<> {
-      auto id = obj->get_id();
-      auto status = (co_await self->process_broadcast(src, std::move(obj)).wrap()).move_as_status();
-      LOG_IF(WARNING, status.is_error() && status.code() != ErrorCode::notready)
-          << "Failed to process broadcast (type=" << id << ") from " << src << ": " << status;
-      co_return {};
-    }(self, src, move_tl_object_as<std::remove_reference_t<decltype(object)>>(Q))
-                                                                      .start()
-                                                                      .detach();
+    handle_process_broadcast_result(
+        self->process_broadcast(src, move_tl_object_as<std::remove_reference_t<decltype(object)>>(Q)));
   });
 }
 
@@ -385,7 +510,6 @@ void OverlayImpl::alarm() {
     } else {
       update_neighbours(0);
     }
-    process_pending_peers();
     alarm_timestamp() = td::Timestamp::in(1.0);
   } else {
     if (update_neighbours_at_.is_in_past()) {
@@ -415,21 +539,39 @@ void OverlayImpl::start_up() {
 
   if (!opts_.twostep_broadcast_sender_.empty()) {
     td::actor::send_closure(opts_.twostep_broadcast_sender_, &adnl::AdnlSenderEx::add_id, local_id_);
-    update_peers_mtu();
   }
+  if (!opts_.experimental_broadcast_sender_.empty() &&
+      !(opts_.experimental_broadcast_sender_ == opts_.twostep_broadcast_sender_)) {
+    td::actor::send_closure(opts_.experimental_broadcast_sender_, &adnl::AdnlSenderEx::add_id, local_id_);
+  }
+  update_peers_mtu();
 }
 
 void OverlayImpl::update_peers_mtu() {
-  if (!opts_.twostep_broadcast_sender_.empty()) {
-    td::uint64 mtu = rules_.max_broadcast_size() + 1024;
-    std::vector<adnl::AdnlNodeIdShort> peers;
-    iterate_all_peers([&](const adnl::AdnlNodeIdShort &peer_id, const OverlayPeer &peer) {
-      if (peer.is_permanent_member() && peer_id != local_id_) {
-        peers.push_back(peer_id);
-      }
-    });
-    peers_mtu_guard_ = adnl::PeersMtuGuard{opts_.twostep_broadcast_sender_, local_id_, std::move(peers), mtu};
+  broadcast_peers_mtu_guard_ = {};
+  if (opts_.twostep_broadcast_sender_.empty() && opts_.experimental_broadcast_sender_.empty()) {
+    return;
   }
+
+  td::uint64 mtu = rules_.max_broadcast_size() + 1024;
+  broadcast_peers_mtu_guard_ =
+      adnl::PeersMtuGuard{{opts_.twostep_broadcast_sender_, opts_.experimental_broadcast_sender_}, local_id_, mtu};
+  iterate_all_peers([&](const adnl::AdnlNodeIdShort &peer_id, const OverlayPeer &peer) {
+    if (peer_needs_mtu(peer_id, peer)) {
+      broadcast_peers_mtu_guard_.set_peer(peer_id, true);
+    }
+  });
+}
+
+void OverlayImpl::touch_peer_mtu(const adnl::AdnlNodeIdShort &peer_id) {
+  auto *peer = peer_list_.peers_.get(peer_id);
+  bool needs_mtu = peer != nullptr && peer_needs_mtu(peer_id, *peer);
+  broadcast_peers_mtu_guard_.set_peer(peer_id, needs_mtu);
+}
+
+bool OverlayImpl::peer_needs_mtu(const adnl::AdnlNodeIdShort &peer_id, const OverlayPeer &peer) const {
+  return peer_id != local_id_ &&
+         (peer.is_permanent_member() || peer.is_neighbour() || overlay_type_ == OverlayType::Public);
 }
 
 void OverlayImpl::receive_dht_nodes(dht::DhtValue v) {
@@ -446,7 +588,7 @@ void OverlayImpl::receive_dht_nodes(dht::DhtValue v) {
         nodes.emplace_back(N.move_as_ok());
       }
     }
-    add_peers(std::move(nodes), /* verified = */ false);
+    add_peers(std::move(nodes), /*verified=*/false);
   } else {
     VLOG(OVERLAY_WARNING) << this << ": incorrect value in DHT for overlay nodes: " << R.move_as_error();
   }
@@ -509,6 +651,7 @@ void OverlayImpl::bcast_gc() {
   broadcasts_simple_.gc(this);
   broadcasts_fec_.gc(this);
   broadcasts_twostep_.gc(this);
+  broadcasts_v2_.gc();
   while (bcast_lru_.size() > max_bcasts()) {
     auto Id = bcast_lru_.front();
     bcast_lru_.pop();
@@ -531,6 +674,25 @@ void OverlayImpl::send_broadcast(PublicKeyHash send_as, td::uint32 flags, td::Bu
   broadcasts_simple_.send(this, send_as, std::move(data), flags);
 }
 
+std::optional<BroadcastMode> OverlayImpl::choose_broadcast_mode(td::Slice data) {
+  if (!experimental_broadcast_algorithm_) {
+    return std::nullopt;
+  }
+  CHECK(!experimental_broadcast_algorithm_->empty());
+  BroadcastModeRequest request{.algorithm = *experimental_broadcast_algorithm_,
+                               .data_size = static_cast<td::uint32>(data.size())};
+  iterate_all_peers([&](const adnl::AdnlNodeIdShort &, OverlayPeer &peer) {
+    if (peer.is_permanent_member()) {
+      ++request.persistent_peer_count;
+    }
+  });
+  auto mode = ::ton::overlay::choose_overlay_broadcast_mode(request);
+  if (mode.is_error()) {
+    LOG(FATAL) << "invalid broadcast algorithm: " << mode.move_as_error();
+  }
+  return mode.move_as_ok();
+}
+
 void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data,
                                      td::BufferSlice extra) {
   if (!has_valid_membership_certificate()) {
@@ -544,9 +706,18 @@ void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td
   }
   bool no_twostep = flags & Overlays::BroadcastFlagNoTwostep();
   flags &= ~Overlays::BroadcastFlagNoTwostep();
-  if (opts_.send_twostep_broadcast_ && !no_twostep) {
-    broadcasts_twostep_.send(this, send_as, std::move(data), std::move(extra), flags);
-  } else {
+  if (!no_twostep) {
+    if (auto mode = choose_broadcast_mode(data.as_slice())) {
+      BroadcastSource source{.public_key = {}, .key_hash = send_as, .certificate = get_certificate(send_as)};
+      broadcasts_v2_.send(this, std::move(source), std::move(*mode), std::move(data), std::move(extra), flags);
+      return;
+    }
+    if (opts_.send_twostep_broadcast_) {
+      broadcasts_twostep_.send(this, send_as, std::move(data), std::move(extra), flags);
+      return;
+    }
+  }
+  {
     if (!extra.empty()) {
       LOG(WARNING) << "Broadcast extra for old fec broadcast is not supported";
     }
@@ -579,9 +750,6 @@ BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash &sou
   if (!cert || r == BroadcastCheckResult::Allowed || overlay_type_ == OverlayType::FixedMemberList) {
     return r;
   }
-  if (!rules_.is_authorized_key(cert->issuer_hash())) {
-    return r;
-  }
   auto &limiter = authorized_key_limiters_[cert->issuer_hash()];
   td::Bits256 cert_hash = get_tl_object_sha_bits256(cert->tl());
   std::pair cache_key{source, cert_hash};
@@ -593,7 +761,6 @@ BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash &sou
     td::Timestamp now = td::Timestamp::now();
     if (!limiter.certificate_check_rate_limiter_.check(now)) {
       VLOG(OVERLAY_NOTICE) << "dropping certificate from " << cert->issuer_hash() << " : rate limit exceeded";
-      r2 = BroadcastCheckResult::Forbidden;
     } else {
       td::Status check_result;
       {
@@ -659,6 +826,10 @@ void OverlayImpl::broadcast_twostep_signed_fec(BroadcastTwostepDataFec &&data,
   broadcasts_twostep_.signed_fec(this, std::move(data), std::move(R));
 }
 
+void OverlayImpl::broadcast_v2_request_timer(Overlay::BroadcastHash broadcast_id, td::uint64 token) {
+  broadcasts_v2_.on_timer_fired(broadcast_id, token);
+}
+
 void OverlayImpl::deliver_broadcast(PublicKeyHash source, td::BufferSlice data, td::BufferSlice extra) {
   callback_->receive_broadcast_with_extra(source, overlay_id_, std::move(data), std::move(extra));
 }
@@ -718,6 +889,13 @@ td::actor::Task<> OverlayImpl::precheck_broadcast(PublicKeyHash src, td::Bits256
   auto [task, promise] = td::actor::StartedTask<>::make_bridge();
   callback_->precheck_broadcast(src, overlay_id_, broadcast_id, std::move(extra), signature_checked,
                                 std::move(promise));
+  co_await std::move(task);
+  co_return {};
+}
+
+td::actor::Task<> OverlayImpl::check_broadcast(PublicKeyHash src, td::BufferSlice data) {
+  auto [task, promise] = td::actor::StartedTask<>::make_bridge();
+  callback_->check_broadcast(src, overlay_id_, std::move(data), std::move(promise));
   co_await std::move(task);
   co_return {};
 }
@@ -806,7 +984,8 @@ td::Status OverlayImpl::check_signature_from_peer(PublicKey key, td::Slice messa
   auto S = enc->check_signature(message, signature);
   if (S.is_error() && !message_from.is_zero()) {
     reject_signatures_from_.insert(message_from);
-    LOG(WARNING) << "ban signatures from peer " << message_from << " for " << REJECT_SIGNATURES_DURATION << " s";
+    VLOG(OVERLAY_NOTICE) << this << ": ban signatures from peer " << message_from << " for "
+                         << REJECT_SIGNATURES_DURATION << " s";
     auto task = [](OverlayImpl *self, adnl::AdnlNodeIdShort peer) -> td::actor::Task<> {
       co_await td::actor::coro_sleep(td::Timestamp::in(REJECT_SIGNATURES_DURATION));
       self->reject_signatures_from_.erase(peer);
@@ -832,14 +1011,7 @@ BroadcastsLimiter &OverlayImpl::get_broadcasts_limiter(PublicKeyHash source, con
     source = certificate->issuer_hash();
   }
   if (rules_.is_authorized_key(source)) {
-    AuthorizedKeyLimiter &limiter = authorized_key_limiters_[source];
-    if (!limiter.broadcasts_inited_) {
-      limiter.broadcasts_.key = source;
-      limiter.broadcasts_.broadcast_rate_limiter_ = td::RateLimiterWindow{opts_.auth_broadcast_rate_limit_};
-      limiter.broadcasts_.broadcast_size_rate_limiter_ = td::RateLimiterWindow{opts_.auth_broadcast_size_rate_limit_};
-      limiter.broadcasts_inited_ = true;
-    }
-    return limiter.broadcasts_;
+    return authorized_key_limiters_[source].broadcasts_;
   }
   return unauthorized_broadcasts_limiter_;
 }
@@ -879,6 +1051,12 @@ void BroadcastsLimiter::init_stats(double now) {
   stats_inited = true;
 }
 
+td::Status BroadcastsLimiter::try_register_broadcast(td::uint64 total_size) {
+  TRY_STATUS(precheck_new_broadcast(total_size));
+  register_broadcast(total_size);
+  return td::Status::OK();
+}
+
 td::Status BroadcastsLimiter::precheck_new_broadcast(td::uint64 total_size) {
   td::Timestamp now = td::Timestamp::now();
   if (!broadcast_rate_limiter_.check(now)) {
@@ -896,16 +1074,7 @@ td::Status BroadcastsLimiter::precheck_new_broadcast(td::uint64 total_size) {
   return td::Status::OK();
 }
 
-td::Status BroadcastsLimiter::try_register_broadcast(td::uint64 total_size) {
-  TRY_STATUS(precheck_new_broadcast(total_size));
-  register_broadcast(total_size);
-  return td::Status::OK();
-}
-
 void BroadcastsLimiter::register_broadcast(td::uint64 total_size) {
-  td::Timestamp now = td::Timestamp::now();
-  broadcast_rate_limiter_.insert(now);
-  broadcast_size_rate_limiter_.insert(now, total_size);
   init_stats();
   ++stats_current.count;
   stats_current.total_size += total_size;
@@ -921,6 +1090,87 @@ tl_object_ptr<ton_api::engine_validator_overlayStatsBroadcasts> BroadcastsLimite
   return create_tl_object<ton_api::engine_validator_overlayStatsBroadcasts>(
       src.bits256_value(), stats_prev.ts_start, stats_prev.ts_end, stats_prev.count, stats_prev.total_size,
       stats_prev.total_out_traffic);
+}
+
+// === Env (overlay broadcast V2) =====================================================================
+
+std::vector<BroadcastPeerInfo> OverlayImpl::peers() {
+  std::vector<BroadcastPeerInfo> result;
+  result.reserve(peer_list_.peers_.size());
+  double now = td::Time::now();
+  iterate_all_peers([&](const adnl::AdnlNodeIdShort &peer_id, OverlayPeer &peer) {
+    if (peer_id == local_id_ || (!peer.is_alive() && !peer.is_neighbour())) {
+      return;
+    }
+    result.push_back(BroadcastPeerInfo{.id = peer_id,
+                                       .score = peer.broadcast_score.value_at(now),
+                                       .neighbour = peer.is_neighbour(),
+                                       .persistent = peer.is_permanent_member()});
+  });
+  return result;
+}
+
+std::optional<BroadcastPeerInfo> OverlayImpl::peer_info(adnl::AdnlNodeIdShort peer) {
+  if (peer == local_id_) {
+    return std::nullopt;
+  }
+  auto *p = peer_list_.peers_.get(peer);
+  if (p == nullptr || !p->is_alive()) {
+    return std::nullopt;
+  }
+  return BroadcastPeerInfo{.id = peer,
+                           .score = p->broadcast_score.value_at(td::Time::now()),
+                           .neighbour = p->is_neighbour(),
+                           .persistent = p->is_permanent_member()};
+}
+
+void OverlayImpl::update_peer_score(adnl::AdnlNodeIdShort peer, double delta) {
+  update_peer_broadcast_score(peer, delta);
+}
+
+td::actor::Task<BroadcastCheckResult> OverlayImpl::precheck_source(const BroadcastSource &source,
+                                                                   const BroadcastMeta &meta,
+                                                                   adnl::AdnlNodeIdShort from, bool signature_checked) {
+  if (check_date(meta.info.common.date).is_error()) {
+    co_return BroadcastCheckResult::Forbidden;
+  }
+  auto result = check_source_eligible(source.key_hash, source.certificate.get(), meta.info.common.data_size,
+                                      /*is_fec=*/true, from);
+  if (result == BroadcastCheckResult::Forbidden) {
+    co_return result;
+  }
+  co_await precheck_broadcast(source.key_hash, meta.broadcast_id, meta.info.common.extra.clone(), signature_checked);
+  co_return result;
+}
+
+td::actor::Task<> OverlayImpl::verify_decoded_body(BroadcastSource source, td::BufferSlice body) {
+  return check_broadcast(source.key_hash, std::move(body));
+}
+
+void OverlayImpl::deliver(PublicKeyHash sender, td::BufferSlice body, td::BufferSlice extra) {
+  deliver_broadcast(sender, std::move(body), std::move(extra));
+}
+
+void OverlayImpl::send(adnl::AdnlNodeIdShort dst, td::BufferSlice wire) {
+  auto sender = opts_.experimental_broadcast_sender_;
+  CHECK(!sender.empty());
+  td::actor::send_closure(manager_, &Overlays::send_message_via, dst, local_id_, overlay_id_, std::move(wire), sender);
+}
+
+td::actor::StartedTask<std::pair<td::BufferSlice, PublicKey>> OverlayImpl::sign(PublicKeyHash key_hash,
+                                                                                td::BufferSlice to_sign) {
+  auto [task, promise] = td::actor::StartedTask<std::pair<td::BufferSlice, PublicKey>>::make_bridge();
+  td::actor::send_closure(keyring_, &keyring::Keyring::sign_add_get_public_key, key_hash, std::move(to_sign),
+                          std::move(promise));
+  return std::move(task);
+}
+
+void OverlayImpl::schedule_dispatch_timer(td::Bits256 broadcast_id, td::Timestamp alarm, td::uint64 token) {
+  delay_action(
+      [SelfId = actor_id(this), broadcast_id, token]() {
+        td::actor::send_closure(SelfId, &OverlayImpl::broadcast_v2_request_timer, broadcast_id, token);
+      },
+      alarm);
 }
 
 }  // namespace overlay

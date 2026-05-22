@@ -19,6 +19,8 @@
 #pragma once
 
 #include <map>
+#include <optional>
+#include <string>
 
 #include "adnl/adnl-node-id.hpp"
 #include "adnl/adnl-sender-ex.h"
@@ -36,6 +38,19 @@ namespace ton {
 namespace overlay {
 
 enum class OverlayType { Public, FixedMemberList, CertificatedMembers };
+
+enum class ExperimentalBroadcastOverlay { Public, FastSync, Private };
+
+void set_experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay, std::string algorithm);
+void clear_experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay);
+std::optional<std::string> get_experimental_broadcast_algorithm(ExperimentalBroadcastOverlay overlay);
+
+// Host-tunable engine knobs, loaded once at engine construction.
+struct OverlayBroadcastOptions {
+  td::uint32 active_peer_limit = 5;
+  td::uint32 lazy_peer_limit = 20;
+  td::uint32 known_peer_limit = 100;
+};
 
 class OverlayIdShort {
  public:
@@ -297,6 +312,8 @@ struct OverlayOptions {
 
   td::actor::ActorId<adnl::AdnlSenderEx> twostep_broadcast_sender_ = {};
   bool send_twostep_broadcast_ = false;
+  td::actor::ActorId<adnl::AdnlSenderEx> experimental_broadcast_sender_ = {};
+  OverlayBroadcastOptions broadcast_options_{.active_peer_limit = 6, .lazy_peer_limit = 10, .known_peer_limit = 80};
   bool allow_old_broadcasts_ = true;  // non-twostep broadcasts
 
   td::RateLimiterWindow::Params auth_broadcast_rate_limit_ = {};

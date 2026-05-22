@@ -16,6 +16,8 @@
 */
 #pragma once
 
+#include <set>
+
 #include "adnl.h"
 
 namespace ton::adnl {
@@ -65,52 +67,98 @@ class AdnlSenderEx : public AdnlSenderInterface {
 class PeersMtuGuard {
  public:
   PeersMtuGuard() = default;
-  PeersMtuGuard(td::actor::ActorId<AdnlSenderEx> sender, AdnlNodeIdShort local_id,
-                std::vector<AdnlNodeIdShort> peer_ids, td::uint64 mtu)
-      : sender_(std::move(sender)), local_id_(local_id), peer_ids_(std::move(peer_ids)), mtu_(mtu) {
-    for (const AdnlNodeIdShort peer_id : peer_ids_) {
-      td::actor::send_closure(sender_, &AdnlSenderEx::add_peer_mtu, local_id_, peer_id, mtu_);
+  PeersMtuGuard(td::actor::ActorId<AdnlSenderEx> sender, AdnlNodeIdShort local_id, td::uint64 mtu)
+      : local_id_(local_id), mtu_(mtu) {
+    add_sender(std::move(sender));
+  }
+  PeersMtuGuard(std::vector<td::actor::ActorId<AdnlSenderEx>> senders, AdnlNodeIdShort local_id, td::uint64 mtu)
+      : local_id_(local_id), mtu_(mtu) {
+    for (auto &sender : senders) {
+      add_sender(std::move(sender));
     }
   }
-  PeersMtuGuard(const PeersMtuGuard&) = delete;
-  PeersMtuGuard(PeersMtuGuard&& other) noexcept
-      : sender_(std::move(other.sender_))
+  PeersMtuGuard(td::actor::ActorId<AdnlSenderEx> sender, AdnlNodeIdShort local_id,
+                std::vector<AdnlNodeIdShort> peer_ids, td::uint64 mtu)
+      : PeersMtuGuard(std::move(sender), local_id, mtu) {
+    for (const auto &peer_id : peer_ids) {
+      set_peer(peer_id, true);
+    }
+  }
+  PeersMtuGuard(const PeersMtuGuard &) = delete;
+  PeersMtuGuard(PeersMtuGuard &&other) noexcept
+      : senders_(std::move(other.senders_))
       , local_id_(other.local_id_)
       , peer_ids_(std::move(other.peer_ids_))
       , mtu_(other.mtu_) {
-    other.sender_ = {};
+    other.senders_.clear();
   }
   ~PeersMtuGuard() {
     reset();
   }
-  PeersMtuGuard& operator=(const PeersMtuGuard& other) = delete;
-  PeersMtuGuard& operator=(PeersMtuGuard&& other) noexcept {
+  PeersMtuGuard &operator=(const PeersMtuGuard &other) = delete;
+  PeersMtuGuard &operator=(PeersMtuGuard &&other) noexcept {
     if (this == &other) {
       return *this;
     }
     reset();
-    sender_ = std::move(other.sender_);
+    senders_ = std::move(other.senders_);
     local_id_ = other.local_id_;
     peer_ids_ = std::move(other.peer_ids_);
     mtu_ = other.mtu_;
-    other.sender_ = {};
+    other.senders_.clear();
     return *this;
   }
 
+  void set_peer(AdnlNodeIdShort peer_id, bool enabled) {
+    if (senders_.empty()) {
+      return;
+    }
+    bool exists = peer_ids_.count(peer_id) > 0;
+    if (enabled == exists) {
+      return;
+    }
+    if (enabled) {
+      peer_ids_.insert(peer_id);
+      for (auto &sender : senders_) {
+        td::actor::send_closure(sender, &AdnlSenderEx::add_peer_mtu, local_id_, peer_id, mtu_);
+      }
+    } else {
+      peer_ids_.erase(peer_id);
+      for (auto &sender : senders_) {
+        td::actor::send_closure(sender, &AdnlSenderEx::remove_peer_mtu, local_id_, peer_id, mtu_);
+      }
+    }
+  }
+
  private:
-  td::actor::ActorId<AdnlSenderEx> sender_;
+  std::vector<td::actor::ActorId<AdnlSenderEx>> senders_;
   AdnlNodeIdShort local_id_;
-  std::vector<AdnlNodeIdShort> peer_ids_;
+  std::set<AdnlNodeIdShort> peer_ids_;
   td::uint64 mtu_ = 0;
 
+  void add_sender(td::actor::ActorId<AdnlSenderEx> sender) {
+    if (sender.empty()) {
+      return;
+    }
+    for (const auto &existing : senders_) {
+      if (existing == sender) {
+        return;
+      }
+    }
+    senders_.push_back(std::move(sender));
+  }
+
   void reset() {
-    if (sender_.empty()) {
+    if (senders_.empty()) {
       return;
     }
     for (const AdnlNodeIdShort peer_id : peer_ids_) {
-      td::actor::send_closure(sender_, &AdnlSenderEx::remove_peer_mtu, local_id_, peer_id, mtu_);
+      for (auto &sender : senders_) {
+        td::actor::send_closure(sender, &AdnlSenderEx::remove_peer_mtu, local_id_, peer_id, mtu_);
+      }
     }
     peer_ids_.clear();
+    senders_.clear();
   }
 };
 

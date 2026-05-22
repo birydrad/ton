@@ -329,6 +329,7 @@ void FullNodeCustomOverlay::init() {
   overlay_options.broadcast_speed_multiplier_ = opts_.private_broadcast_speed_multiplier_;
   overlay_options.send_twostep_broadcast_ = true;
   overlay_options.twostep_broadcast_sender_ = adnl_sender_;
+  overlay_options.experimental_broadcast_sender_ = adnl_sender_;
   td::actor::send_closure(
       overlays_, &overlay::Overlays::create_private_overlay_ex, local_id_, overlay_id_full_.clone(), nodes_,
       std::make_unique<Callback>(actor_id(this)), rules,
