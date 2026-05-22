@@ -24,6 +24,33 @@
 
 namespace td {
 namespace fec {
+DecodeResult DecodeResult::need_more() {
+  return DecodeResult{};
+}
+
+DecodeResult DecodeResult::ready(DataWithEncoder data) {
+  DecodeResult result;
+  result.state = State::Ready;
+  result.data = std::move(data);
+  return result;
+}
+
+bool DecodeResult::is_ready() const {
+  return state == State::Ready;
+}
+
+Result<DecodeResult> Decoder::try_decode_v2(bool need_encoder) {
+  if (!may_try_decode()) {
+    return DecodeResult::need_more();
+  }
+  TRY_RESULT(data, try_decode(need_encoder));
+  return DecodeResult::ready(std::move(data));
+}
+
+Result<Symbol> Decoder::gen_symbol(uint32) const {
+  return Status::Error("decoder cannot generate symbols");
+}
+
 std::unique_ptr<RoundRobinEncoder> RoundRobinEncoder::create(BufferSlice data, size_t max_symbol_size) {
   CHECK(max_symbol_size > 0);
   return std::make_unique<RoundRobinEncoder>(std::move(data), max_symbol_size);
@@ -141,6 +168,17 @@ Result<DataWithEncoder> RaptorQDecoder::try_decode(bool need_encoder) {
   res.data = std::move(data_with_encoder.data);
   res.encoder = std::make_unique<RaptorQEncoder>(std::move(data_with_encoder.encoder));
   return std::move(res);
+}
+
+Result<DecodeResult> RaptorQDecoder::try_decode_v2(bool need_encoder) {
+  if (!may_try_decode()) {
+    return DecodeResult::need_more();
+  }
+  auto decoded = try_decode(need_encoder);
+  if (decoded.is_error()) {
+    return DecodeResult::need_more();
+  }
+  return DecodeResult::ready(decoded.move_as_ok());
 }
 
 Status RaptorQDecoder::add_symbol(Symbol symbol) {

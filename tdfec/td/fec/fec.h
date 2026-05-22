@@ -48,6 +48,18 @@ struct DataWithEncoder {
   std::unique_ptr<Encoder> encoder;
 };
 
+struct DecodeResult {
+  enum class State { NeedMore, Ready };
+
+  static DecodeResult need_more();
+  static DecodeResult ready(DataWithEncoder data);
+
+  bool is_ready() const;
+
+  State state = State::NeedMore;
+  DataWithEncoder data;
+};
+
 class Encoder {
  public:
   virtual Symbol gen_symbol(uint32 id) = 0;
@@ -77,7 +89,9 @@ class Decoder {
   }
   virtual bool may_try_decode() const = 0;
   virtual Result<DataWithEncoder> try_decode(bool need_encoder) = 0;
+  virtual Result<DecodeResult> try_decode_v2(bool need_encoder);
   virtual Status add_symbol(Symbol symbol) = 0;
+  virtual Result<Symbol> gen_symbol(uint32 id) const;
 };
 
 class RoundRobinEncoder : public Encoder {
@@ -148,6 +162,7 @@ class RaptorQDecoder : public Decoder {
   static Result<std::unique_ptr<RaptorQDecoder>> create(RaptorQEncoder::Parameters parameters);
   bool may_try_decode() const override;
   Result<DataWithEncoder> try_decode(bool need_encoder) override;
+  Result<DecodeResult> try_decode_v2(bool need_encoder) override;
   Status add_symbol(Symbol symbol) override;
   explicit RaptorQDecoder(std::unique_ptr<raptorq::Decoder> decoder);
   ~RaptorQDecoder() override;

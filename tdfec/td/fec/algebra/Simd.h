@@ -29,10 +29,18 @@
 #define TD_SSE3 1
 #endif
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#define TD_NEON 1
+#endif
+
 #if TD_AVX2
 #include <immintrin.h> /* avx2 */
 #elif TD_SSE3
 #include <tmmintrin.h> /* ssse3 */
+#endif
+
+#if TD_NEON
+#include <arm_neon.h>
 #endif
 
 namespace td {
@@ -163,6 +171,64 @@ class Simd_sse : public Simd_null {
 };
 #endif  // SSSE3
 
+#if TD_NEON
+class Simd_neon : public Simd_null {
+ public:
+  static constexpr size_t alignment() {
+    return 32;
+  }
+
+  static std::string get_name() {
+    return "With NEON";
+  }
+
+  static bool is_aligned_pointer(const void *ptr) {
+    return ::td::is_aligned_pointer<alignment()>(ptr);
+  }
+
+  static void gf256_add(void *a, const void *b, size_t size) {
+    DCHECK(is_aligned_pointer(a));
+    DCHECK(is_aligned_pointer(b));
+    auto *ap = reinterpret_cast<uint8 *>(a);
+    const auto *bp = reinterpret_cast<const uint8 *>(b);
+    for (size_t idx = 0; idx < size; idx += 16) {
+      vst1q_u8(ap + idx, veorq_u8(vld1q_u8(ap + idx), vld1q_u8(bp + idx)));
+    }
+  }
+
+  static void gf256_mul(void *a, uint8 u, size_t size) {
+    DCHECK(is_aligned_pointer(a));
+    auto *ap = reinterpret_cast<uint8 *>(a);
+    const auto mask = vdupq_n_u8(0x0f);
+    const auto urow_hi = vld1q_u8(Octet::OctMulHi[u]);
+    const auto urow_lo = vld1q_u8(Octet::OctMulLo[u]);
+    for (size_t idx = 0; idx < size; idx += 16) {
+      auto ax = vld1q_u8(ap + idx);
+      auto lo = vandq_u8(ax, mask);
+      auto hi = vandq_u8(vshrq_n_u8(ax, 4), mask);
+      vst1q_u8(ap + idx, veorq_u8(vqtbl1q_u8(urow_lo, lo), vqtbl1q_u8(urow_hi, hi)));
+    }
+  }
+
+  static void gf256_add_mul(void *a, const void *b, uint8 u, size_t size) {
+    DCHECK(is_aligned_pointer(a));
+    DCHECK(is_aligned_pointer(b));
+    auto *ap = reinterpret_cast<uint8 *>(a);
+    const auto *bp = reinterpret_cast<const uint8 *>(b);
+    const auto mask = vdupq_n_u8(0x0f);
+    const auto urow_hi = vld1q_u8(Octet::OctMulHi[u]);
+    const auto urow_lo = vld1q_u8(Octet::OctMulLo[u]);
+    for (size_t idx = 0; idx < size; idx += 16) {
+      auto bx = vld1q_u8(bp + idx);
+      auto lo = vandq_u8(bx, mask);
+      auto hi = vandq_u8(vshrq_n_u8(bx, 4), mask);
+      auto product = veorq_u8(vqtbl1q_u8(urow_lo, lo), vqtbl1q_u8(urow_hi, hi));
+      vst1q_u8(ap + idx, veorq_u8(vld1q_u8(ap + idx), product));
+    }
+  }
+};
+#endif  // NEON
+
 #ifdef TD_AVX2
 class Simd_avx : public Simd_sse {
  public:
@@ -258,6 +324,8 @@ class Simd_avx : public Simd_sse {
 using Simd = Simd_avx;
 #elif TD_SSE3
 using Simd = Simd_sse;
+#elif TD_NEON
+using Simd = Simd_neon;
 #else
 using Simd = Simd_null;
 #endif
