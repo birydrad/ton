@@ -15,16 +15,20 @@ ninja -C cmake-build-relwithdebinfo broadcast-bench test-bsim test-overlay-broad
 cmake-build-relwithdebinfo/test/broadcast-sim/test-bsim
 cmake-build-relwithdebinfo/test/broadcast-sim/test-overlay-broadcast-session
 
-# Benchmark on real mainnet topology (needs /tmp/overlay-graph-mainnet.json + /tmp/latency_matrix.json)
-cmake-build-relwithdebinfo/test/broadcast-sim/broadcast-bench \
-    --graph=mainnet --body-size=1048576 --rounds=10 --seeds=3 --view=algo
-
 # Benchmark on synthetic topology (procedural mesh/line/star, no external data needed)
 cmake-build-relwithdebinfo/test/broadcast-sim/broadcast-bench --suite=quick
 
+# Benchmark on real mainnet topology — first prepare the inputs:
+#   cp /path/to/overlay-peers.sim.json /tmp/overlay-peers.json
+#   test/broadcast-sim/prepare_mainnet_topology.sh    # geolocates IPs → /tmp/latency_matrix.json
+# Then run:
+cmake-build-relwithdebinfo/test/broadcast-sim/broadcast-bench \
+    --graph=mainnet --peers=/tmp/overlay-peers.json --latency=/tmp/latency_matrix.json \
+    --body-size=1048576 --rounds=10 --seeds=3 --view=algo
+
 # HTML report from a CSV
 cmake-build-relwithdebinfo/test/broadcast-sim/broadcast-bench \
-    --graph=mainnet --csv=/tmp/bench.csv
+    --graph=mainnet --peers=/tmp/overlay-peers.json --csv=/tmp/bench.csv
 python3 test/broadcast-sim/render_bench.py --csv=/tmp/bench.csv --out=/tmp/report.html
 
 # End-to-end leech experiment against real ADNL + overlay process

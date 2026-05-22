@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -1210,19 +1211,29 @@ int mainnet_main(int argc, char *argv[]);
 }
 
 int main(int argc, char *argv[]) {
-  // Peek for `--graph mainnet` before parsing — the mainnet path has its own CLI surface, so we
-  // hand off the full argv to it. Default is synthetic mode (the legacy bench path).
-  for (int i = 1; i < argc; i++) {
+  // Peek for `--graph mainnet` / `--graph=mainnet` before parsing — the mainnet path has its own
+  // CLI surface, so we hand off the full argv to it. Default is synthetic mode.
+  auto graph_value = [&](int i) -> std::string {
     std::string arg = argv[i];
+    if (arg.rfind("--graph=", 0) == 0) {
+      return arg.substr(std::strlen("--graph="));
+    }
     if (arg == "--graph" && i + 1 < argc) {
-      std::string value = argv[i + 1];
-      if (value == "mainnet") {
-        return ton::bsim_runner::mainnet_main(argc, argv);
-      }
-      if (value != "synthetic") {
-        std::cerr << "--graph must be synthetic or mainnet\n";
-        return 2;
-      }
+      return argv[i + 1];
+    }
+    return {};
+  };
+  for (int i = 1; i < argc; i++) {
+    auto value = graph_value(i);
+    if (value.empty()) {
+      continue;
+    }
+    if (value == "mainnet") {
+      return ton::bsim_runner::mainnet_main(argc, argv);
+    }
+    if (value != "synthetic") {
+      std::cerr << "--graph must be synthetic or mainnet\n";
+      return 2;
     }
   }
 
